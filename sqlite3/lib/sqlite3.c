@@ -1,6 +1,6 @@
 /******************************************************************************
 ** This file is an amalgamation of many separate C source files from SQLite
-** version 3.25.0.  By combining all the individual C code files into this
+** version 3.25.2.  By combining all the individual C code files into this
 ** single large file, the entire code can be compiled as a single translation
 ** unit.  This allows many compilers to do optimizations that would not be
 ** possible if the files were compiled separately.  Performance improvements
@@ -1156,9 +1156,9 @@ extern "C" {
 ** [sqlite3_libversion_number()], [sqlite3_sourceid()],
 ** [sqlite_version()] and [sqlite_source_id()].
 */
-#define SQLITE_VERSION        "3.25.0"
-#define SQLITE_VERSION_NUMBER 3025000
-#define SQLITE_SOURCE_ID      "2018-09-15 04:01:47 b63af6c3bd33152742648d5d2e8dc5d5fcbcdd27df409272b6aea00a6f761760"
+#define SQLITE_VERSION        "3.25.2"
+#define SQLITE_VERSION_NUMBER 3025002
+#define SQLITE_SOURCE_ID      "2018-09-25 19:08:10 fb90e7189ae6d62e77ba3a308ca5d683f90bbe633cf681865365b8e92792d1c7"
 
 /*
 ** CAPI3REF: Run-Time Library Version Numbers
@@ -16269,6 +16269,7 @@ struct sqlite3 {
 #define SQLITE_EnableQPSG     0x00800000  /* Query Planner Stability Guarantee*/
 #define SQLITE_TriggerEQP     0x01000000  /* Show trigger EXPLAIN QUERY PLAN */
 #define SQLITE_ResetDatabase  0x02000000  /* Reset the database */
+#define SQLITE_LegacyAlter    0x04000000  /* Legacy ALTER TABLE behaviour */
 
 /* Flags used only if debugging */
 #ifdef SQLITE_DEBUG
@@ -32619,7 +32620,11 @@ static struct unix_syscall {
 #define osLstat      ((int(*)(const char*,struct stat*))aSyscall[27].pCurrent)
 
 #if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+# ifdef __ANDROID__
+  { "ioctl", (sqlite3_syscall_ptr)(int(*)(int, int, ...))ioctl, 0 },
+# else
   { "ioctl",         (sqlite3_syscall_ptr)ioctl,          0 },
+# endif
 #else
   { "ioctl",         (sqlite3_syscall_ptr)0,              0 },
 #endif
@@ -89713,7 +89718,10 @@ case OP_VNext: {   /* jump */
 case OP_VRename: {
   sqlite3_vtab *pVtab;
   Mem *pName;
-
+  int isLegacy;
+  
+  isLegacy = (db->flags & SQLITE_LegacyAlter);
+  db->flags |= SQLITE_LegacyAlter;
   pVtab = pOp->p4.pVtab->pVtab;
   pName = &aMem[pOp->p1];
   assert( pVtab->pModule->xRename );
@@ -89727,6 +89735,7 @@ case OP_VRename: {
   rc = sqlite3VdbeChangeEncoding(pName, SQLITE_UTF8);
   if( rc ) goto abort_due_to_error;
   rc = pVtab->pModule->xRename(pVtab, pName->z);
+  if( isLegacy==0 ) db->flags &= ~SQLITE_LegacyAlter;
   sqlite3VtabImportErrmsg(p, pVtab);
   p->expired = 0;
   if( rc ) goto abort_due_to_error;
@@ -97047,16 +97056,13 @@ static Expr *exprDup(sqlite3 *db, Expr *p, int dupFlags, u8 **pzBuffer){
     }
 
     /* Fill in pNew->pLeft and pNew->pRight. */
+    zAlloc += dupedExprNodeSize(p, dupFlags);
     if( ExprHasProperty(pNew, EP_Reduced|EP_TokenOnly) ){
-      zAlloc += dupedExprNodeSize(p, dupFlags);
       if( !ExprHasProperty(pNew, EP_TokenOnly|EP_Leaf) ){
         pNew->pLeft = p->pLeft ?
                       exprDup(db, p->pLeft, EXPRDUP_REDUCE, &zAlloc) : 0;
         pNew->pRight = p->pRight ?
                        exprDup(db, p->pRight, EXPRDUP_REDUCE, &zAlloc) : 0;
-      }
-      if( pzBuffer ){
-        *pzBuffer = zAlloc;
       }
     }else{
 #ifndef SQLITE_OMIT_WINDOWFUNC
@@ -97076,6 +97082,9 @@ static Expr *exprDup(sqlite3 *db, Expr *p, int dupFlags, u8 **pzBuffer){
         }
         pNew->pRight = sqlite3ExprDup(db, p->pRight, 0);
       }
+    }
+    if( pzBuffer ){
+      *pzBuffer = zAlloc;
     }
   }
   return pNew;
@@ -100628,18 +100637,15 @@ SQLITE_PRIVATE int sqlite3ExprImpliesExpr(Parse *pParse, Expr *pE1, Expr *pE2, i
 /*
 ** This is the Expr node callback for sqlite3ExprImpliesNotNullRow().
 ** If the expression node requires that the table at pWalker->iCur
-** have a non-NULL column, then set pWalker->eCode to 1 and abort.
+** have one or more non-NULL column, then set pWalker->eCode to 1 and abort.
+**
+** This routine controls an optimization.  False positives (setting
+** pWalker->eCode to 1 when it should not be) are deadly, but false-negatives
+** (never setting pWalker->eCode) is a harmless missed optimization.
 */
 static int impliesNotNullRow(Walker *pWalker, Expr *pExpr){
-  /* This routine is only called for WHERE clause expressions and so it
-  ** cannot have any TK_AGG_COLUMN entries because those are only found
-  ** in HAVING clauses.  We can get a TK_AGG_FUNCTION in a WHERE clause,
-  ** but that is an illegal construct and the query will be rejected at
-  ** a later stage of processing, so the TK_AGG_FUNCTION case does not
-  ** need to be considered here. */
-  assert( pExpr->op!=TK_AGG_COLUMN );
+  testcase( pExpr->op==TK_AGG_COLUMN );
   testcase( pExpr->op==TK_AGG_FUNCTION );
-
   if( ExprHasProperty(pExpr, EP_FromJoin) ) return WRC_Prune;
   switch( pExpr->op ){
     case TK_ISNOT:
@@ -101298,20 +101304,6 @@ SQLITE_PRIVATE void sqlite3AlterRenameTable(
     goto exit_rename_table;
   }
 
-  /* If this is a virtual table, invoke the xRename() function if
-  ** one is defined. The xRename() callback will modify the names
-  ** of any resources used by the v-table implementation (including other
-  ** SQLite tables) that are identified by the name of the virtual table.
-  */
-#ifndef SQLITE_OMIT_VIRTUALTABLE
-  if( pVTab ){
-    int i = ++pParse->nMem;
-    sqlite3VdbeLoadString(v, i, zName);
-    sqlite3VdbeAddOp4(v, OP_VRename, i, 0, 0,(const char*)pVTab, P4_VTAB);
-    sqlite3MayAbort(pParse);
-  }
-#endif
-
   /* figure out how many UTF-8 characters are in zName */
   zTabName = pTab->zName;
   nTabName = sqlite3Utf8CharLen(zTabName, -1);
@@ -101368,6 +101360,20 @@ SQLITE_PRIVATE void sqlite3AlterRenameTable(
             "WHERE type IN ('view', 'trigger')"
         , zDb, zTabName, zName, zTabName, zDb, zName);
   }
+
+  /* If this is a virtual table, invoke the xRename() function if
+  ** one is defined. The xRename() callback will modify the names
+  ** of any resources used by the v-table implementation (including other
+  ** SQLite tables) that are identified by the name of the virtual table.
+  */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( pVTab ){
+    int i = ++pParse->nMem;
+    sqlite3VdbeLoadString(v, i, zName);
+    sqlite3VdbeAddOp4(v, OP_VRename, i, 0, 0,(const char*)pVTab, P4_VTAB);
+    sqlite3MayAbort(pParse);
+  }
+#endif
 
   renameReloadSchema(pParse, iDb);
   renameTestSchema(pParse, zDb, iDb==1);
@@ -102205,7 +102211,7 @@ static int renameResolveTrigger(Parse *pParse, const char *zDb){
       Table *pTarget = sqlite3LocateTable(pParse, 0, pStep->zTarget, zDb);
       if( pTarget==0 ){
         rc = SQLITE_ERROR;
-      }else{
+      }else if( SQLITE_OK==(rc = sqlite3ViewGetColumnNames(pParse, pTarget)) ){
         SrcList sSrc;
         memset(&sSrc, 0, sizeof(sSrc));
         sSrc.nSrc = 1;
@@ -102551,17 +102557,20 @@ static void renameTableFunc(
     rc = renameParseSql(&sParse, zDb, 1, db, zInput, bTemp);
 
     if( rc==SQLITE_OK ){
+      int isLegacy = (db->flags & SQLITE_LegacyAlter);
       if( sParse.pNewTable ){
         Table *pTab = sParse.pNewTable;
 
         if( pTab->pSelect ){
-          NameContext sNC;
-          memset(&sNC, 0, sizeof(sNC));
-          sNC.pParse = &sParse;
+          if( isLegacy==0 ){
+            NameContext sNC;
+            memset(&sNC, 0, sizeof(sNC));
+            sNC.pParse = &sParse;
 
-          sqlite3SelectPrep(&sParse, pTab->pSelect, &sNC);
-          if( sParse.nErr ) rc = sParse.rc;
-          sqlite3WalkSelect(&sWalker, pTab->pSelect);
+            sqlite3SelectPrep(&sParse, pTab->pSelect, &sNC);
+            if( sParse.nErr ) rc = sParse.rc;
+            sqlite3WalkSelect(&sWalker, pTab->pSelect);
+          }
         }else{
           /* Modify any FK definitions to point to the new table. */
 #ifndef SQLITE_OMIT_FOREIGN_KEY
@@ -102580,7 +102589,9 @@ static void renameTableFunc(
           ** "CREATE [VIRTUAL] TABLE" bit. */
           if( sqlite3_stricmp(zOld, pTab->zName)==0 ){
             sCtx.pTab = pTab;
-            sqlite3WalkExprList(&sWalker, pTab->pCheck);
+            if( isLegacy==0 ){
+              sqlite3WalkExprList(&sWalker, pTab->pCheck);
+            }
             renameTokenFind(&sParse, &sCtx, pTab->zName);
           }
         }
@@ -102588,7 +102599,9 @@ static void renameTableFunc(
 
       else if( sParse.pNewIndex ){
         renameTokenFind(&sParse, &sCtx, sParse.pNewIndex->zName);
-        sqlite3WalkExpr(&sWalker, sParse.pNewIndex->pPartIdxWhere);
+        if( isLegacy==0 ){
+          sqlite3WalkExpr(&sWalker, sParse.pNewIndex->pPartIdxWhere);
+        }
       }
 
 #ifndef SQLITE_OMIT_TRIGGER
@@ -102601,12 +102614,14 @@ static void renameTableFunc(
           renameTokenFind(&sParse, &sCtx, sParse.pNewTrigger->table);
         }
 
-        rc = renameResolveTrigger(&sParse, bTemp ? 0 : zDb);
-        if( rc==SQLITE_OK ){
-          renameWalkTrigger(&sWalker, pTrigger);
-          for(pStep=pTrigger->step_list; pStep; pStep=pStep->pNext){
-            if( pStep->zTarget && 0==sqlite3_stricmp(pStep->zTarget, zOld) ){
-              renameTokenFind(&sParse, &sCtx, pStep->zTarget);
+        if( isLegacy==0 ){
+          rc = renameResolveTrigger(&sParse, bTemp ? 0 : zDb);
+          if( rc==SQLITE_OK ){
+            renameWalkTrigger(&sWalker, pTrigger);
+            for(pStep=pTrigger->step_list; pStep; pStep=pStep->pNext){
+              if( pStep->zTarget && 0==sqlite3_stricmp(pStep->zTarget, zOld) ){
+                renameTokenFind(&sParse, &sCtx, pStep->zTarget);
+              }
             }
           }
         }
@@ -102664,6 +102679,7 @@ static void renameTableTest(
   char const *zDb = (const char*)sqlite3_value_text(argv[0]);
   char const *zInput = (const char*)sqlite3_value_text(argv[1]);
   int bTemp = sqlite3_value_int(argv[4]);
+  int isLegacy = (db->flags & SQLITE_LegacyAlter);
 
 #ifndef SQLITE_OMIT_AUTHORIZATION
   sqlite3_xauth xAuth = db->xAuth;
@@ -102676,7 +102692,7 @@ static void renameTableTest(
     Parse sParse;
     rc = renameParseSql(&sParse, zDb, 1, db, zInput, bTemp);
     if( rc==SQLITE_OK ){
-      if( sParse.pNewTable && sParse.pNewTable->pSelect ){
+      if( isLegacy==0 && sParse.pNewTable && sParse.pNewTable->pSelect ){
         NameContext sNC;
         memset(&sNC, 0, sizeof(sNC));
         sNC.pParse = &sParse;
@@ -102685,7 +102701,9 @@ static void renameTableTest(
       }
 
       else if( sParse.pNewTrigger ){
-        rc = renameResolveTrigger(&sParse, bTemp ? 0 : zDb);
+        if( isLegacy==0 ){
+          rc = renameResolveTrigger(&sParse, bTemp ? 0 : zDb);
+        }
         if( rc==SQLITE_OK ){
           int i1 = sqlite3SchemaToIndex(db, sParse.pNewTrigger->pTabSchema);
           int i2 = sqlite3FindDbName(db, zDb);
@@ -107335,10 +107353,6 @@ static void convertToWithoutRowidTable(Parse *pParse, Table *pTab){
     }
   }
 
-  /* The remaining transformations only apply to b-tree tables, not to
-  ** virtual tables */
-  if( IN_DECLARE_VTAB ) return;
-
   /* Convert the P3 operand of the OP_CreateBtree opcode from BTREE_INTKEY
   ** into BTREE_BLOBKEY.
   */
@@ -107851,6 +107865,10 @@ SQLITE_PRIVATE int sqlite3ViewGetColumnNames(Parse *pParse, Table *pTable){
   assert( pTable->pSelect );
   pSel = sqlite3SelectDup(db, pTable->pSelect, 0);
   if( pSel ){
+#ifndef SQLITE_OMIT_ALTERTABLE
+    u8 eParseMode = pParse->eParseMode;
+    pParse->eParseMode = PARSE_MODE_NORMAL;
+#endif
     n = pParse->nTab;
     sqlite3SrcListAssignCursors(pParse, pSel->pSrc);
     pTable->nCol = -1;
@@ -107896,6 +107914,9 @@ SQLITE_PRIVATE int sqlite3ViewGetColumnNames(Parse *pParse, Table *pTable){
     sqlite3DeleteTable(db, pSelTab);
     sqlite3SelectDelete(db, pSel);
     db->lookaside.bDisable--;
+#ifndef SQLITE_OMIT_ALTERTABLE
+    pParse->eParseMode = eParseMode;
+#endif
   } else {
     nErr++;
   }
@@ -119462,6 +119483,11 @@ static const PragmaName aPragmaName[] = {
   /* iArg:      */ 0 },
 #endif
 #if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+ {/* zName:     */ "legacy_alter_table",
+  /* ePragTyp:  */ PragTyp_FLAG,
+  /* ePragFlg:  */ PragFlg_Result0|PragFlg_NoColumns1,
+  /* ColNames:  */ 0, 0,
+  /* iArg:      */ SQLITE_LegacyAlter },
  {/* zName:     */ "legacy_file_format",
   /* ePragTyp:  */ PragTyp_FLAG,
   /* ePragFlg:  */ PragFlg_Result0|PragFlg_NoColumns1,
@@ -119715,7 +119741,7 @@ static const PragmaName aPragmaName[] = {
   /* iArg:      */ SQLITE_WriteSchema },
 #endif
 };
-/* Number of pragmas: 60 on by default, 77 total. */
+/* Number of pragmas: 61 on by default, 78 total. */
 
 /************** End of pragma.h **********************************************/
 /************** Continuing where we left off in pragma.c *********************/
@@ -129183,6 +129209,7 @@ SQLITE_PRIVATE int sqlite3Select(
       sqlite3VdbeAddOp2(v, OP_Goto, 0, iBreak);
       sqlite3VdbeResolveLabel(v, addrGosub);
       VdbeNoopComment((v, "inner-loop subroutine"));
+      sSort.labelOBLopt = 0;
       selectInnerLoop(pParse, p, -1, &sSort, &sDistinct, pDest, iCont, iBreak);
       sqlite3VdbeResolveLabel(v, iCont);
       sqlite3VdbeAddOp1(v, OP_Return, regGosub);
@@ -154756,6 +154783,7 @@ static int openDatabase(
   db->nDb = 2;
   db->magic = SQLITE_MAGIC_BUSY;
   db->aDb = db->aDbStatic;
+  db->lookaside.bDisable = 1;
 
   assert( sizeof(db->aLimit)==sizeof(aHardLimit) );
   memcpy(db->aLimit, aHardLimit, sizeof(db->aLimit));
@@ -214417,7 +214445,7 @@ static void fts5SourceIdFunc(
 ){
   assert( nArg==0 );
   UNUSED_PARAM2(nArg, apUnused);
-  sqlite3_result_text(pCtx, "fts5: 2018-09-15 04:01:47 b63af6c3bd33152742648d5d2e8dc5d5fcbcdd27df409272b6aea00a6f761760", -1, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, "fts5: 2018-09-25 19:08:10 fb90e7189ae6d62e77ba3a308ca5d683f90bbe633cf681865365b8e92792d1c7", -1, SQLITE_TRANSIENT);
 }
 
 static int fts5Init(sqlite3 *db){
@@ -219127,9 +219155,9 @@ SQLITE_API int sqlite3_stmt_init(
 #endif /* !defined(SQLITE_CORE) || defined(SQLITE_ENABLE_STMTVTAB) */
 
 /************** End of stmt.c ************************************************/
-#if __LINE__!=219130
+#if __LINE__!=219158
 #undef SQLITE_SOURCE_ID
-#define SQLITE_SOURCE_ID      "2018-09-15 04:01:47 b63af6c3bd33152742648d5d2e8dc5d5fcbcdd27df409272b6aea00a6f76alt2"
+#define SQLITE_SOURCE_ID      "2018-09-25 19:08:10 fb90e7189ae6d62e77ba3a308ca5d683f90bbe633cf681865365b8e92792alt2"
 #endif
 /* Return the source-id for this library */
 SQLITE_API const char *sqlite3_sourceid(void){ return SQLITE_SOURCE_ID; }
