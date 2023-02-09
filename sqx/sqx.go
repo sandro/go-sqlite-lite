@@ -65,7 +65,10 @@ func (o *Conn) Close() {
 
 func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) {
 	stmt, err := o.Prepare(sql)
-	check(err)
+	if err != nil {
+		log.Println("Prepare statement failed", sql, args)
+		log.Panic(err)
+	}
 	check(stmt.Bind(args...))
 	defer stmt.Reset()
 	hasRow, err := stmt.Step()
@@ -105,15 +108,68 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) {
 	}
 }
 
+func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
+	log.Println("EXEC2", sql, args)
+	stmt, err := o.Prepare(sql)
+	if err != nil {
+		log.Println("STMT ERR", err)
+		return DBResult{}, err
+	}
+	log.Println("stmt", stmt)
+	if stmt.Tail != "" {
+		err = o.Exec(sql, args...)
+	} else {
+		err = stmt.Exec(args...)
+	}
+	if err != nil {
+		log.Println("EXEC ERR", err, args)
+		return DBResult{}, err
+	}
+	res := DBResult{
+		lastInsertID: o.LastInsertRowID(),
+		rowsAffected: int64(o.Changes()),
+		err:          err,
+	}
+	log.Println("GOT RESULT", res)
+	return res, err
+}
+
+// stmt, err := conn.Prepare(`insert or replace into vendors (id, name, indexed_at, location, created_at, updated_at)
+// VALUES (?, ?, ?, ?, ?, ?)`)
+
+func (o Conn) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
+	tableSQL += " (" + strings.Join(colNames, ",") + ")"
+	binds := []string{}
+	for range colNames {
+		binds = append(binds, "?")
+	}
+	tableSQL += "VALUES(" + strings.Join(binds, ",") + ")"
+	return o.Exec2(tableSQL, values...)
+}
+
+// update users set x=1
+func (o Conn) UpdateValues(tableSQL string, where string, colNames []string, values ...interface{}) (sql.Result, error) {
+	for i, name := range colNames {
+		tableSQL += fmt.Sprintf(" %s=?", name)
+		if i < len(colNames)-1 {
+			tableSQL += ","
+		}
+	}
+	tableSQL += " " + where
+	return o.Exec2(tableSQL, values...)
+}
+
 // https://github.com/blockloop/scan/blob/master/scanner.go
 func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
+	// log.Println("IN dbToStruct", value)
 	vType := value.Type()
 	nCols := stmt.ColumnCount()
-	// log.Println(vType, nCols)
+	// log.Println("vType", vType, nCols, value.NumField())
 	for fi := 0; fi < value.NumField(); fi++ {
 		field := vType.Field(fi)
-		// log.Println("field is", field, field.Type.Kind(), value.NumField())
+		// log.Println("field is", field, value.Field(fi), field.Type.Kind(), value.NumField())
 		if field.Type.Kind() == reflect.Struct && field.Type.String() != "time.Time" {
+			// log.Println("field is struct, call dbToStruct")
 			dbToStruct(value.Field(fi), stmt)
 			continue
 		}
@@ -126,6 +182,7 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 
 		for i := 0; i < nCols; i++ {
 			colName := stmt.ColumnName(i)
+			// log.Println("name colname i", name, colName, i)
 			if name == colName || strings.ToLower(name) == colName {
 				// log.Println("getting colName", colName, nCols, i)
 				// f := value.FieldByName(name)
@@ -141,6 +198,7 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 					check(err)
 					f.SetString(val)
 				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					// log.Println("found int continue")
 					val, _, err := stmt.ColumnInt64(i)
 					f.SetInt(val)
 					check(err)
@@ -153,6 +211,7 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 					check(err)
 					f.SetBytes(val)
 				case reflect.Struct:
+					// log.Println("case statement has struct", f.Kind())
 					t := f.Type()
 					base := reflect.New(t)
 					m := base.MethodByName("UnmarshalText")
@@ -160,14 +219,14 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 						val, err := stmt.ColumnBlob(i)
 						check(err)
 						if len(val) == 0 {
-							// log.Println("SKIPPING", colName, string(val), len(val))
+							log.Println("SKIPPING", colName, string(val), len(val))
 							continue
 						}
 						// log.Println("col blob", string(val))
 						res := m.Call([]reflect.Value{reflect.ValueOf(val)})
 						if !res[0].IsNil() {
 							err = res[0].Interface().(error)
-							log.Println(err)
+							log.Println("have error", err)
 							continue
 							// check(err)
 						}
@@ -184,6 +243,7 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 				default:
 					log.Panicln("unknown reflection type", colName, f, f.Kind())
 				}
+				break
 			}
 		}
 	}
@@ -284,6 +344,40 @@ func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	defer o.Checkin(db)
 	db.Get(dest, sql, args...)
 	return nil
+}
+
+func (o DBPool) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
+	db := o.CheckoutWriter()
+	defer o.CheckinWriter(db)
+	return db.InsertValues(tableSQL, colNames, values...)
+}
+
+func (o DBPool) UpdateValues(tableSQL, where string, colNames []string, values ...interface{}) (sql.Result, error) {
+	db := o.CheckoutWriter()
+	defer o.CheckinWriter(db)
+	return db.UpdateValues(tableSQL, where, colNames, values...)
+}
+
+func (o *DBPool) Tx(f func(c *Conn) error) {
+	conn := o.CheckoutWriter()
+	defer o.CheckinWriter(conn)
+	check(conn.Begin())
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("recovered", r)
+			check(conn.Rollback())
+			panic(r)
+		}
+	}()
+
+	err := f(conn)
+	if err != nil {
+		check(conn.Rollback())
+	} else {
+		check(conn.Commit())
+	}
+
 }
 
 func NewDBPool(uri string, size int) *DBPool {
