@@ -109,13 +109,13 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) {
 }
 
 func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
-	log.Println("EXEC2", sql, args)
+	// log.Println("EXEC2", sql, args)
 	stmt, err := o.Prepare(sql)
 	if err != nil {
 		log.Println("STMT ERR", err)
 		return DBResult{}, err
 	}
-	log.Println("stmt", stmt)
+	// log.Println("stmt", stmt)
 	if stmt.Tail != "" {
 		err = o.Exec(sql, args...)
 	} else {
@@ -130,7 +130,7 @@ func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
 		rowsAffected: int64(o.Changes()),
 		err:          err,
 	}
-	log.Println("GOT RESULT", res)
+	// log.Println("GOT RESULT", res)
 	return res, err
 }
 
