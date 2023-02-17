@@ -63,32 +63,45 @@ func (o *Conn) Close() {
 	o.Conn.Close()
 }
 
-func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) {
+func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 	stmt, err := o.Prepare(sql)
 	if err != nil {
 		log.Println("Prepare statement failed", sql, args)
-		log.Panic(err)
+		// log.Panic(err)
+		return err
 	}
-	check(stmt.Bind(args...))
+	err = stmt.Bind(args...)
+	if err != nil {
+		return err
+	}
 	defer stmt.Reset()
 	hasRow, err := stmt.Step()
-	check(err)
+	if err != nil {
+		return err
+	}
 	if !hasRow {
 		log.Println("no rows")
-		return
 	}
 	value := reflect.ValueOf(dest).Elem()
 	dbToStruct(value, stmt)
+	return err
 }
 
-func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) {
+func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 	stmt, err := o.Prepare(sql)
-	check(err)
+	if err != nil {
+		return err
+	}
 	defer stmt.Reset()
-	check(stmt.Bind(args...))
+	stmt.Bind(args...)
+	if err != nil {
+		return err
+	}
 	for {
 		hasRow, err := stmt.Step()
-		check(err)
+		if err != nil {
+			return err
+		}
 		if !hasRow {
 			// log.Println("no row")
 			break
@@ -106,6 +119,7 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) {
 		dbToStruct(v, stmt)
 		direct.Set(reflect.Append(direct, v))
 	}
+	return err
 }
 
 func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
@@ -335,15 +349,13 @@ func (o *DBPool) Exec(sql string, args ...interface{}) (sql.Result, error) {
 func (o *DBPool) Select(dest interface{}, sql string, args ...interface{}) error {
 	db := o.Checkout()
 	defer o.Checkin(db)
-	db.Select(dest, sql, args...)
-	return nil
+	return db.Select(dest, sql, args...)
 }
 
 func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	db := o.Checkout()
 	defer o.Checkin(db)
-	db.Get(dest, sql, args...)
-	return nil
+	return db.Get(dest, sql, args...)
 }
 
 func (o DBPool) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
