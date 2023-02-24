@@ -80,7 +80,7 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 		return err
 	}
 	if !hasRow {
-		log.Println("no rows")
+		// log.Println("no rows")
 	}
 	value := reflect.ValueOf(dest).Elem()
 	dbToStruct(value, stmt)
