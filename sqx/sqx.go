@@ -42,6 +42,23 @@ func NewConn(uri string, readonly bool) *Conn {
 	return &conn
 }
 
+func (o Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
+	err := o.Conn.Exec(sql, args...)
+	return o, err
+}
+
+func (o Conn) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
+	vals := []struct{ Version int64 }{}
+	err = o.Select(&vals, query, args...)
+	if err != nil {
+		return
+	}
+	for _, v := range vals {
+		versions = append(versions, v.Version)
+	}
+	return
+}
+
 func (o *Conn) Prepare(sql string) (*sqlite3.Stmt, error) {
 	stmt, ok := o.stmtCache[sql]
 	if ok {
@@ -123,29 +140,21 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 }
 
 func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
-	// log.Println("EXEC2", sql, args)
 	stmt, err := o.Prepare(sql)
 	if err != nil {
 		log.Println("STMT ERR", err)
-		return DBResult{}, err
+		return o, err
 	}
-	// log.Println("stmt", stmt)
 	if stmt.Tail != "" {
-		err = o.Exec(sql, args...)
+		_, err = o.Exec(sql, args...)
 	} else {
 		err = stmt.Exec(args...)
 	}
 	if err != nil {
 		log.Println("EXEC ERR", err, args)
-		return DBResult{}, err
+		return o, err
 	}
-	res := DBResult{
-		lastInsertID: o.LastInsertRowID(),
-		rowsAffected: int64(o.Changes()),
-		err:          err,
-	}
-	// log.Println("GOT RESULT", res)
-	return res, err
+	return o, err
 }
 
 // stmt, err := conn.Prepare(`insert or replace into vendors (id, name, indexed_at, location, created_at, updated_at)
@@ -171,6 +180,14 @@ func (o Conn) UpdateValues(tableSQL string, where string, colNames []string, val
 	}
 	tableSQL += " " + where
 	return o.Exec2(tableSQL, values...)
+}
+
+func (o Conn) LastInsertId() (int64, error) {
+	return o.Conn.LastInsertRowID(), nil
+}
+
+func (o Conn) RowsAffected() (int64, error) {
+	return int64(o.Conn.Changes()), nil
 }
 
 // https://github.com/blockloop/scan/blob/master/scanner.go
@@ -263,20 +280,6 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 	}
 }
 
-type DBResult struct {
-	lastInsertID int64
-	rowsAffected int64
-	err          error
-}
-
-func (o DBResult) LastInsertId() (int64, error) {
-	return o.lastInsertID, o.err
-}
-
-func (o DBResult) RowsAffected() (int64, error) {
-	return o.rowsAffected, o.err
-}
-
 type SqlExecutor interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
 	Insert(list ...interface{}) error
@@ -318,14 +321,14 @@ func (o *DBPool) Close() {
 	o.wconn.Close()
 }
 
-func (o *DBPool) Exec(sql string, args ...interface{}) (sql.Result, error) {
+func (o *DBPool) Exec(sql string, args ...interface{}) error {
 	db := o.CheckoutWriter()
 	defer o.CheckinWriter(db)
 	log.Println("EXEC", sql, args)
 	stmt, err := db.Prepare(sql)
 	if err != nil {
 		log.Println("STMT ERR", err)
-		return DBResult{}, err
+		return err
 	}
 	log.Println("stmt", stmt)
 	if stmt.Tail != "" {
@@ -335,15 +338,9 @@ func (o *DBPool) Exec(sql string, args ...interface{}) (sql.Result, error) {
 	}
 	if err != nil {
 		log.Println("EXEC ERR", err, args)
-		return DBResult{}, err
+		return err
 	}
-	res := DBResult{
-		lastInsertID: db.LastInsertRowID(),
-		rowsAffected: int64(db.Changes()),
-		err:          err,
-	}
-	log.Println("GOT RESULT", res)
-	return res, err
+	return err
 }
 
 func (o *DBPool) Select(dest interface{}, sql string, args ...interface{}) error {
@@ -358,16 +355,18 @@ func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	return db.Get(dest, sql, args...)
 }
 
-func (o DBPool) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
+func (o DBPool) InsertValues(tableSQL string, colNames []string, values ...interface{}) error {
 	db := o.CheckoutWriter()
 	defer o.CheckinWriter(db)
-	return db.InsertValues(tableSQL, colNames, values...)
+	_, err := db.InsertValues(tableSQL, colNames, values...)
+	return err
 }
 
-func (o DBPool) UpdateValues(tableSQL, where string, colNames []string, values ...interface{}) (sql.Result, error) {
+func (o DBPool) UpdateValues(tableSQL, where string, colNames []string, values ...interface{}) error {
 	db := o.CheckoutWriter()
 	defer o.CheckinWriter(db)
-	return db.UpdateValues(tableSQL, where, colNames, values...)
+	_, err := db.UpdateValues(tableSQL, where, colNames, values...)
+	return err
 }
 
 func (o *DBPool) Tx(f func(c *Conn) error) {
@@ -389,7 +388,6 @@ func (o *DBPool) Tx(f func(c *Conn) error) {
 	} else {
 		check(conn.Commit())
 	}
-
 }
 
 func NewDBPool(uri string, size int) *DBPool {
@@ -490,17 +488,4 @@ func InSQL(sql string, in []string) string {
 	bindStr := strings.Join(binds, ",")
 	newSQL := fmt.Sprintf("%s in (%s)", sql, bindStr)
 	return newSQL
-}
-
-func (o *DBPool) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
-	vals := []struct{ Version int64 }{}
-	err = o.Select(&vals, query, args...)
-	if err != nil {
-		return
-	}
-	for _, v := range vals {
-		versions = append(versions, v.Version)
-	}
-	log.Println("GetVersions", versions)
-	return
 }
