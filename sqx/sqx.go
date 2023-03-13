@@ -371,7 +371,7 @@ func (o DBPool) UpdateValues(tableSQL, where string, colNames []string, values .
 	return err
 }
 
-func (o *DBPool) Tx(f func(c *Conn) error) {
+func (o *DBPool) Tx(f func(c *Conn) error) error {
 	conn := o.CheckoutWriter()
 	defer o.CheckinWriter(conn)
 	check(conn.Begin())
@@ -390,6 +390,7 @@ func (o *DBPool) Tx(f func(c *Conn) error) {
 	} else {
 		check(conn.Commit())
 	}
+	return err
 }
 
 func NewDBPool(uri string, size int) *DBPool {
