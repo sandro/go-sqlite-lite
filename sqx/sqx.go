@@ -42,12 +42,12 @@ func NewConn(uri string, readonly bool) *Conn {
 	return &conn
 }
 
-func (o Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
+func (o *Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
 	err := o.Conn.Exec(sql, args...)
 	return o, err
 }
 
-func (o Conn) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
+func (o *Conn) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
 	vals := []struct{ Version int64 }{}
 	err = o.Select(&vals, query, args...)
 	if err != nil {
@@ -61,6 +61,7 @@ func (o Conn) GetVersions(query string, args ...interface{}) (versions []int64, 
 
 func (o *Conn) Prepare(sql string) (*sqlite3.Stmt, error) {
 	stmt, ok := o.stmtCache[sql]
+	// TODO check if statement is closed before proceeding
 	if ok {
 		err := stmt.ClearBindings()
 		return stmt, err
@@ -97,6 +98,7 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 		return err
 	}
 	if !hasRow {
+		return nil
 		// log.Println("no rows")
 	}
 	value := reflect.ValueOf(dest).Elem()
@@ -160,7 +162,7 @@ func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
 // stmt, err := conn.Prepare(`insert or replace into vendors (id, name, indexed_at, location, created_at, updated_at)
 // VALUES (?, ?, ?, ?, ?, ?)`)
 
-func (o Conn) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
+func (o *Conn) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
 	tableSQL += " (" + strings.Join(colNames, ",") + ")"
 	binds := []string{}
 	for range colNames {
@@ -171,7 +173,7 @@ func (o Conn) InsertValues(tableSQL string, colNames []string, values ...interfa
 }
 
 // update users set x=1
-func (o Conn) UpdateValues(tableSQL string, where string, colNames []string, values ...interface{}) (sql.Result, error) {
+func (o *Conn) UpdateValues(tableSQL string, where string, colNames []string, values ...interface{}) (sql.Result, error) {
 	for i, name := range colNames {
 		tableSQL += fmt.Sprintf(" %s=?", name)
 		if i < len(colNames)-1 {
@@ -182,11 +184,11 @@ func (o Conn) UpdateValues(tableSQL string, where string, colNames []string, val
 	return o.Exec2(tableSQL, values...)
 }
 
-func (o Conn) LastInsertId() (int64, error) {
+func (o *Conn) LastInsertId() (int64, error) {
 	return o.Conn.LastInsertRowID(), nil
 }
 
-func (o Conn) RowsAffected() (int64, error) {
+func (o *Conn) RowsAffected() (int64, error) {
 	return int64(o.Conn.Changes()), nil
 }
 
@@ -250,7 +252,7 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 						val, err := stmt.ColumnBlob(i)
 						check(err)
 						if len(val) == 0 {
-							log.Println("SKIPPING", colName, string(val), len(val))
+							// log.Println("SKIPPING", colName, string(val), len(val))
 							continue
 						}
 						// log.Println("col blob", string(val))
@@ -324,13 +326,13 @@ func (o *DBPool) Close() {
 func (o *DBPool) Exec(sql string, args ...interface{}) error {
 	db := o.CheckoutWriter()
 	defer o.CheckinWriter(db)
-	log.Println("EXEC", sql, args)
+	// log.Println("EXEC", sql, args)
 	stmt, err := db.Prepare(sql)
 	if err != nil {
 		log.Println("STMT ERR", err)
 		return err
 	}
-	log.Println("stmt", stmt)
+	// log.Println("stmt", stmt)
 	if stmt.Tail != "" {
 		err = db.Conn.Exec(sql, args...)
 	} else {
