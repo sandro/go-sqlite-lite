@@ -153,7 +153,7 @@ func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
 		err = stmt.Exec(args...)
 	}
 	if err != nil {
-		log.Println("EXEC ERR", err, args)
+		log.Println("EXEC ERR", err, sql, args)
 		return o, err
 	}
 	return o, err
