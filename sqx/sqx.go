@@ -2,6 +2,7 @@ package sqx
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"reflect"
@@ -106,7 +107,7 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 	return err
 }
 
-func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
+func (o *Conn) Select(dest interface{}, sql string, args ...any) error {
 	stmt, err := o.Prepare(sql)
 	if err != nil {
 		return err
@@ -417,63 +418,94 @@ func NewDBPool(uri string, size int) *DBPool {
 }
 
 type BulkInserterCommand struct {
-	Sql  string
 	Args []interface{}
 }
 
 type BulkInserter struct {
-	size  int
-	count int
-	// conn  *Conn
-	mu   sync.Mutex
-	cmds []BulkInserterCommand
-	pool *DBPool
+	prefix string
+	Size   int
+	count  int
+	mu     sync.Mutex
+	cmds   []BulkInserterCommand
+	conn   *Conn
 }
 
-func NewBulkInserter(size int, pool *DBPool) *BulkInserter {
-	return &BulkInserter{
-		size: size,
-		pool: pool,
+// NewBulkInserter returns a string builder
+// prefix should be in form of "insert into table
+func NewBulkInserter(prefix string, conn *Conn) *BulkInserter {
+	inserter := &BulkInserter{
+		prefix: prefix,
+		Size:   999,
+		conn:   conn,
 	}
+	return inserter
 }
 
-func (o *BulkInserter) Add(sql string, args ...interface{}) {
+var ErrArgsGreaterThanSize = errors.New("size cannot support so many args")
+
+func (o *BulkInserter) Add(args ...interface{}) (err error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	// stmt, err := o.conn.Prepare(sql)
 	// check(err)
 	// stmt.Exec(args...)
 	// stmt.ClearBindings()
+	numArgs := len(args)
+	if numArgs > o.Size {
+		return ErrArgsGreaterThanSize
+	}
 	cmd := BulkInserterCommand{
-		Sql:  sql,
 		Args: args,
 	}
-	o.cmds = append(o.cmds, cmd)
-	o.count++
-	if o.count == o.size {
-		o.commit()
-		// check(o.conn.Begin())
+	if o.count+numArgs >= o.Size {
+		err = o.commit()
 	}
+	o.cmds = append(o.cmds, cmd)
+	o.count += numArgs
+	return err
 }
 
-func (o *BulkInserter) commit() {
-	conn := o.pool.CheckoutWriter()
-	defer o.pool.CheckinWriter(conn)
-	check(conn.Begin())
-	for _, cmd := range o.cmds {
-		stmt, err := conn.Prepare(cmd.Sql)
-		check(err)
-		stmt.Exec(cmd.Args...)
+func (o *BulkInserter) commit() (err error) {
+	numCommands := len(o.cmds)
+	if numCommands == 0 {
+		return nil
 	}
-	check(conn.Commit())
+	sql := strings.Builder{}
+	sql.WriteString(o.prefix)
+	sql.WriteString(" VALUES ")
+	allArgs := []any{}
+	for i, cmd := range o.cmds {
+		sql.WriteString("(")
+		numArgs := len(cmd.Args)
+		for ii, arg := range cmd.Args {
+			sql.WriteString("?")
+			if ii < numArgs-1 {
+				sql.WriteString(",")
+			}
+			allArgs = append(allArgs, arg)
+		}
+		sql.WriteString(")")
+		if i < numCommands-1 {
+			sql.WriteString(", ")
+		}
+	}
+	stmt, err := o.conn.Prepare(sql.String())
+	if err != nil {
+		return err
+	}
+	err = stmt.Exec(allArgs...)
+	if err != nil {
+		return err
+	}
 	o.cmds = nil
 	o.count = 0
+	return err
 }
 
-func (o *BulkInserter) Done() {
+func (o *BulkInserter) Done() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.commit()
+	return o.commit()
 }
 
 func intsToStr(ids []int64) (strs []string) {
