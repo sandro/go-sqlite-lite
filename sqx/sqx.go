@@ -107,7 +107,7 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 	return err
 }
 
-func (o *Conn) Select(dest interface{}, sql string, args ...any) error {
+func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 	stmt, err := o.Prepare(sql)
 	if err != nil {
 		return err
@@ -473,7 +473,7 @@ func (o *BulkInserter) commit() (err error) {
 	sql := strings.Builder{}
 	sql.WriteString(o.prefix)
 	sql.WriteString(" VALUES ")
-	allArgs := []any{}
+	allArgs := []interface{}{}
 	for i, cmd := range o.cmds {
 		sql.WriteString("(")
 		numArgs := len(cmd.Args)
