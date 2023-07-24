@@ -515,7 +515,7 @@ func intsToStr(ids []int64) (strs []string) {
 	return
 }
 
-func InSQL(sql string, in []string) string {
+func InSQL[T comparable](sql string, in []T) string {
 	binds := make([]string, len(in))
 	for i := range in {
 		binds[i] = "?"
