@@ -14,6 +14,8 @@ import (
 	"github.com/sandro/go-sqlite-lite/sqlite3"
 )
 
+const MAX_BINDS = 999
+
 func check(args ...interface{}) {
 	err, ok := args[len(args)-1].(error)
 	if ok && err != nil {
@@ -163,26 +165,46 @@ func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
 // stmt, err := conn.Prepare(`insert or replace into vendors (id, name, indexed_at, location, created_at, updated_at)
 // VALUES (?, ?, ?, ?, ?, ?)`)
 
-func (o *Conn) InsertValues(tableSQL string, colNames []string, values ...interface{}) (sql.Result, error) {
-	tableSQL += " (" + strings.Join(colNames, ",") + ")"
-	binds := []string{}
-	for range colNames {
-		binds = append(binds, "?")
+func (o *Conn) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
+	if len(attrs) > MAX_BINDS {
+		return nil, fmt.Errorf("cannot have more than %d bindvars", MAX_BINDS)
 	}
+	colNames := make([]string, len(attrs))
+	binds := make([]string, len(attrs))
+	values := make([]interface{}, len(attrs))
+	i := 0
+	for k, v := range attrs {
+		colNames[i] = k
+		binds[i] = "?"
+		values[i] = v
+		i++
+	}
+	tableSQL += " (" + strings.Join(colNames, ",") + ")"
 	tableSQL += "VALUES(" + strings.Join(binds, ",") + ")"
 	return o.Exec2(tableSQL, values...)
 }
 
 // update users set x=1
-func (o *Conn) UpdateValues(tableSQL string, where string, colNames []string, values ...interface{}) (sql.Result, error) {
+func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) (sql.Result, error) {
+	if len(attrs)+len(whereVals) > MAX_BINDS {
+		return nil, fmt.Errorf("cannot have more than %d bindvars", MAX_BINDS)
+	}
+	colNames := make([]string, len(attrs))
+	values := make([]interface{}, len(attrs))
+	i := 0
+	for k, v := range attrs {
+		colNames[i] = k
+		values[i] = v
+		i++
+	}
 	for i, name := range colNames {
 		tableSQL += fmt.Sprintf(" %s=?", name)
 		if i < len(colNames)-1 {
 			tableSQL += ","
 		}
 	}
-	tableSQL += " " + where
-	return o.Exec2(tableSQL, values...)
+	tableSQL += " " + whereStr
+	return o.Exec2(tableSQL, append(values, whereVals...)...)
 }
 
 func (o *Conn) LastInsertId() (int64, error) {
@@ -358,17 +380,17 @@ func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	return db.Get(dest, sql, args...)
 }
 
-func (o DBPool) InsertValues(tableSQL string, colNames []string, values ...interface{}) error {
+func (o DBPool) InsertValues(tableSQL string, attrs map[string]interface{}) error {
 	db := o.CheckoutWriter()
 	defer o.CheckinWriter(db)
-	_, err := db.InsertValues(tableSQL, colNames, values...)
+	_, err := db.InsertValues(tableSQL, attrs)
 	return err
 }
 
-func (o DBPool) UpdateValues(tableSQL, where string, colNames []string, values ...interface{}) error {
+func (o DBPool) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) error {
 	db := o.CheckoutWriter()
 	defer o.CheckinWriter(db)
-	_, err := db.UpdateValues(tableSQL, where, colNames, values...)
+	_, err := db.UpdateValues(tableSQL, attrs, whereStr, whereVals...)
 	return err
 }
 
@@ -435,7 +457,7 @@ type BulkInserter struct {
 func NewBulkInserter(prefix string, conn *Conn) *BulkInserter {
 	inserter := &BulkInserter{
 		prefix: prefix,
-		Size:   999,
+		Size:   MAX_BINDS,
 		conn:   conn,
 	}
 	return inserter
@@ -516,6 +538,9 @@ func intsToStr(ids []int64) (strs []string) {
 }
 
 func InSQL[T comparable](sql string, in []T) string {
+	if len(in) > MAX_BINDS {
+		return fmt.Sprintf("cannot have more than %d bindvars", MAX_BINDS)
+	}
 	binds := make([]string, len(in))
 	for i := range in {
 		binds[i] = "?"
