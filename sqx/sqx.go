@@ -334,6 +334,8 @@ func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index in
 				val, _, err = stmt.ColumnDouble(index)
 			case sqlite3.TEXT:
 				val, _, err = stmt.ColumnText(index)
+			case sqlite3.NULL:
+				return
 			default:
 				log.Printf("Cannot set time for column %s with type %d (field %v)\n", colName, typ, field)
 			}
