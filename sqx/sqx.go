@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -15,6 +16,13 @@ import (
 )
 
 const MAX_BINDS = 999
+
+var defaultTimeFormats []string = []string{
+	time.RFC3339,
+	"2006-01-02 15:04:05",
+}
+
+var SupportedTimeFormats []string = defaultTimeFormats
 
 func check(args ...interface{}) {
 	err, ok := args[len(args)-1].(error)
@@ -215,94 +223,200 @@ func (o *Conn) RowsAffected() (int64, error) {
 	return int64(o.Conn.Changes()), nil
 }
 
+var timeType reflect.Type = reflect.TypeOf(time.Time{})
+var byteArrayType reflect.Type = reflect.TypeOf([]byte{})
+
+func quacksTime(v reflect.Value) bool {
+	if v.Type() == timeType {
+		return true
+	}
+	if v.CanConvert(timeType) {
+		return true
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if quacksTime(v.Field(i)) {
+				return true
+			}
+		}
+	case reflect.Ptr:
+		return quacksTime(v.Elem())
+	case reflect.Interface:
+		return quacksTime(v.Elem())
+	default:
+		return v.Type() == timeType
+	}
+	return false
+}
+
+func isTime(value reflect.Value) bool {
+	return value.Type() == timeType || value.CanConvert(timeType)
+}
+
+var TimeSetter = func(val any) time.Time {
+	switch val.(type) {
+	case int:
+		return time.Unix(val.(int64), 0)
+	case float64:
+		valF := val.(float64)
+		seconds := int64(valF)
+		nsecs := math.Ceil(valF - float64(seconds)*1e6)
+		return time.Unix(seconds, int64(nsecs))
+	case string:
+		txt := val.(string)
+		for _, format := range SupportedTimeFormats {
+			tm, err := time.Parse(format, txt)
+			if err == nil {
+				return tm
+			}
+		}
+		secs, err := strconv.ParseInt(txt, 10, 64)
+		if err == nil {
+			return time.Unix(secs, 0)
+		}
+		log.Println("Could not set time from", txt)
+	}
+	return time.Time{}
+}
+
+func setTime(value reflect.Value, val interface{}) {
+	tm := TimeSetter(val)
+	if !tm.IsZero() {
+		value.Set(reflect.ValueOf(tm))
+	}
+}
+
+func getFieldName(fieldType reflect.StructField) string {
+	name := fieldType.Name
+	tag := fieldType.Tag.Get("db")
+	if tag != "" {
+		name = tag
+	}
+	return name
+}
+
+func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index int) {
+	switch field.Kind() {
+	case reflect.Bool:
+		b, _, err := stmt.ColumnInt64(index)
+		check(err)
+		field.SetBool(b != 0)
+	case reflect.String:
+		val, _, err := stmt.ColumnText(index)
+		check(err)
+		field.SetString(val)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		// log.Println("found int continue")
+		val, _, err := stmt.ColumnInt64(index)
+		field.SetInt(val)
+		check(err)
+	case reflect.Float32, reflect.Float64:
+		val, _, err := stmt.ColumnDouble(index)
+		field.SetFloat(val)
+		check(err)
+	case reflect.Slice:
+		if field.CanConvert(byteArrayType) {
+			val, err := stmt.ColumnBlob(index)
+			check(err)
+			field.SetBytes(val)
+		} else {
+			log.Println("sqx: unimplemented conversion for slice", colName, field)
+		}
+	case reflect.Struct:
+		if isTime(field) {
+			var err error
+			var val interface{}
+			switch typ := stmt.ColumnType(index); typ {
+			case sqlite3.INTEGER:
+				val, _, err = stmt.ColumnInt64(index)
+			case sqlite3.FLOAT:
+				val, _, err = stmt.ColumnDouble(index)
+			case sqlite3.TEXT:
+				val, _, err = stmt.ColumnText(index)
+			default:
+				log.Printf("Cannot set time for column %s with type %d (field %v)\n", colName, typ, field)
+			}
+			check(err)
+			setTime(field, val)
+		} else {
+			t := field.Type()
+			base := reflect.New(t)
+			m := base.MethodByName("UnmarshalText")
+			if !m.IsZero() {
+				val, err := stmt.ColumnBlob(index)
+				check(err)
+				if len(val) == 0 {
+					// log.Println("SKIPPING", colName, string(val), len(val))
+					// continue
+				}
+				// log.Println("col blob", string(val))
+				res := m.Call([]reflect.Value{reflect.ValueOf(val)})
+				if !res[0].IsNil() {
+					err = res[0].Interface().(error)
+					log.Println("have error", err)
+					// continue
+					// check(err)
+				}
+				field.Set(base.Elem())
+				// err = m.Call
+				// z := base.Interface().(*time.Time)
+				// log.Println("z", z, string(val))
+				// err = z.UnmarshalJSON(val)
+				// check(err)
+				// log.Println(z)
+			} else {
+				log.Println("No UnmarshalText found", colName, field, t, base)
+			}
+		}
+	default:
+		log.Panicln("unknown reflection type", colName, field, field.Kind())
+	}
+}
+
+func fillStruct(value reflect.Value, stmt *sqlite3.Stmt, colName string, index int) {
+	for fi := 0; fi < value.NumField(); fi++ {
+		name := getFieldName(value.Type().Field(fi))
+		f := value.Field(fi)
+		if name == colName || strings.ToLower(name) == colName {
+			fillField(f, stmt, colName, index)
+		} else if f.Kind() == reflect.Struct {
+			fillStruct(f, stmt, colName, index)
+		}
+	}
+}
+
 // https://github.com/blockloop/scan/blob/master/scanner.go
 func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
-	// log.Println("IN dbToStruct", value)
+	// now := time.Now()
 	vType := value.Type()
 	nCols := stmt.ColumnCount()
-	// log.Println("vType", vType, nCols, value.NumField())
-	for fi := 0; fi < value.NumField(); fi++ {
-		field := vType.Field(fi)
-		// log.Println("field is", field, value.Field(fi), field.Type.Kind(), value.NumField())
-		if field.Type.Kind() == reflect.Struct && field.Type.String() != "time.Time" {
-			// log.Println("field is struct, call dbToStruct")
-			dbToStruct(value.Field(fi), stmt)
-			continue
-		}
-		name := field.Name
-		tag := field.Tag.Get("db")
-		if tag != "" {
-			name = tag
-		}
-		f := value.Field(fi)
-
-		for i := 0; i < nCols; i++ {
-			colName := stmt.ColumnName(i)
-			// log.Println("name colname i", name, colName, i)
+	nFields := value.NumField()
+	for i := 0; i < nCols; i++ {
+		colName := stmt.ColumnName(i)
+		matched := false
+		var structFields []reflect.Value
+		for fi := 0; fi < nFields; fi++ {
+			fieldType := vType.Field(fi)
+			name := getFieldName(fieldType)
+			f := value.Field(fi)
 			if name == colName || strings.ToLower(name) == colName {
-				// log.Println("getting colName", colName, nCols, i)
-				// f := value.FieldByName(name)
-				// f := value.Field(i)
-				// log.Println(colName, f.Kind()) //, f.Type().Name())
-				switch f.Kind() {
-				case reflect.Bool:
-					b, _, err := stmt.ColumnInt64(i)
-					check(err)
-					f.SetBool(b != 0)
-				case reflect.String:
-					val, _, err := stmt.ColumnText(i)
-					check(err)
-					f.SetString(val)
-				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-					// log.Println("found int continue")
-					val, _, err := stmt.ColumnInt64(i)
-					f.SetInt(val)
-					check(err)
-				case reflect.Float32, reflect.Float64:
-					val, _, err := stmt.ColumnDouble(i)
-					f.SetFloat(val)
-					check(err)
-				case reflect.Slice:
-					val, err := stmt.ColumnBlob(i)
-					check(err)
-					f.SetBytes(val)
-				case reflect.Struct:
-					// log.Println("case statement has struct", f.Kind())
-					t := f.Type()
-					base := reflect.New(t)
-					m := base.MethodByName("UnmarshalText")
-					if !m.IsZero() {
-						val, err := stmt.ColumnBlob(i)
-						check(err)
-						if len(val) == 0 {
-							// log.Println("SKIPPING", colName, string(val), len(val))
-							continue
-						}
-						// log.Println("col blob", string(val))
-						res := m.Call([]reflect.Value{reflect.ValueOf(val)})
-						if !res[0].IsNil() {
-							err = res[0].Interface().(error)
-							log.Println("have error", err)
-							continue
-							// check(err)
-						}
-						f.Set(base.Elem())
-						// err = m.Call
-						// z := base.Interface().(*time.Time)
-						// log.Println("z", z, string(val))
-						// err = z.UnmarshalJSON(val)
-						// check(err)
-						// log.Println(z)
-					} else {
-						log.Println("No UnmarshalText found", colName, f, t, base)
-					}
-				default:
-					log.Panicln("unknown reflection type", colName, f, f.Kind())
-				}
+				fillField(f, stmt, colName, i)
+				matched = true
 				break
+			} else {
+				if f.Kind() == reflect.Struct {
+					structFields = append(structFields, f)
+				}
+			}
+		}
+		if !matched {
+			for _, field := range structFields {
+				fillStruct(field, stmt, colName, i)
 			}
 		}
 	}
+	// fmt.Println("dbToStruct done", time.Since(now))
 }
 
 type SqlExecutor interface {
