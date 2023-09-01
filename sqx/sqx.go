@@ -141,13 +141,13 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 		// log.Println("has row", stmt.ColumnNames(), id)
 
 		value := reflect.ValueOf(dest)
-		direct := reflect.Indirect(value)
+		indirect := reflect.Indirect(value)
 		slice := value.Type().Elem()
 		base := slice.Elem()
 		vp := reflect.New(base)
 		v := vp.Elem()
 		dbToStruct(v, stmt)
-		direct.Set(reflect.Append(direct, v))
+		indirect.Set(reflect.Append(indirect, v))
 	}
 	return err
 }
@@ -653,9 +653,9 @@ func intsToStr(ids []int64) (strs []string) {
 	return
 }
 
-func InSQL[T comparable](sql string, in []T) string {
+func InSQL[T comparable](sql string, in []T) (string, error) {
 	if len(in) > MAX_BINDS {
-		return fmt.Sprintf("cannot have more than %d bindvars", MAX_BINDS)
+		return "", fmt.Errorf("cannot have more than %d bindvars", MAX_BINDS)
 	}
 	binds := make([]string, len(in))
 	for i := range in {
@@ -663,5 +663,5 @@ func InSQL[T comparable](sql string, in []T) string {
 	}
 	bindStr := strings.Join(binds, ",")
 	newSQL := fmt.Sprintf("%s in (%s)", sql, bindStr)
-	return newSQL
+	return newSQL, nil
 }
