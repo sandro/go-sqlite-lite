@@ -296,30 +296,36 @@ func getFieldName(fieldType reflect.StructField) string {
 	return name
 }
 
-func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index int) {
+func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index int) bool {
+	filled := false
 	switch field.Kind() {
 	case reflect.Bool:
 		b, _, err := stmt.ColumnInt64(index)
 		check(err)
 		field.SetBool(b != 0)
+		filled = true
 	case reflect.String:
 		val, _, err := stmt.ColumnText(index)
 		check(err)
 		field.SetString(val)
+		filled = true
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		// log.Println("found int continue")
 		val, _, err := stmt.ColumnInt64(index)
 		field.SetInt(val)
 		check(err)
+		filled = true
 	case reflect.Float32, reflect.Float64:
 		val, _, err := stmt.ColumnDouble(index)
 		field.SetFloat(val)
 		check(err)
+		filled = true
 	case reflect.Slice:
 		if field.CanConvert(byteArrayType) {
 			val, err := stmt.ColumnBlob(index)
 			check(err)
 			field.SetBytes(val)
+			filled = true
 		} else {
 			log.Println("sqx: unimplemented conversion for slice", colName, field)
 		}
@@ -335,12 +341,13 @@ func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index in
 			case sqlite3.TEXT:
 				val, _, err = stmt.ColumnText(index)
 			case sqlite3.NULL:
-				return
+				return true
 			default:
 				log.Printf("Cannot set time for column %s with type %d (field %v)\n", colName, typ, field)
 			}
 			check(err)
 			setTime(field, val)
+			filled = true
 		} else {
 			t := field.Type()
 			base := reflect.New(t)
@@ -361,6 +368,7 @@ func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index in
 					// check(err)
 				}
 				field.Set(base.Elem())
+				filled = true
 				// err = m.Call
 				// z := base.Interface().(*time.Time)
 				// log.Println("z", z, string(val))
@@ -374,18 +382,24 @@ func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index in
 	default:
 		log.Panicln("unknown reflection type", colName, field, field.Kind())
 	}
+	return filled
 }
 
-func fillStruct(value reflect.Value, stmt *sqlite3.Stmt, colName string, index int) {
+func fillStruct(value reflect.Value, stmt *sqlite3.Stmt, colName string, index int) bool {
+	filled := false
 	for fi := 0; fi < value.NumField(); fi++ {
+		if filled {
+			break
+		}
 		name := getFieldName(value.Type().Field(fi))
 		f := value.Field(fi)
 		if name == colName || strings.ToLower(name) == colName {
-			fillField(f, stmt, colName, index)
+			filled = fillField(f, stmt, colName, index)
 		} else if f.Kind() == reflect.Struct {
-			fillStruct(f, stmt, colName, index)
+			filled = fillStruct(f, stmt, colName, index)
 		}
 	}
+	return filled
 }
 
 // https://github.com/blockloop/scan/blob/master/scanner.go
@@ -394,17 +408,25 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 	vType := value.Type()
 	nCols := stmt.ColumnCount()
 	nFields := value.NumField()
+	filled := make(map[string]struct{})
 	for i := 0; i < nCols; i++ {
 		colName := stmt.ColumnName(i)
+		if _, ok := filled[colName]; ok {
+			continue
+		}
 		matched := false
 		var structFields []reflect.Value
 		for fi := 0; fi < nFields; fi++ {
 			fieldType := vType.Field(fi)
+			if !fieldType.IsExported() {
+				continue
+			}
 			name := getFieldName(fieldType)
 			f := value.Field(fi)
 			if name == colName || strings.ToLower(name) == colName {
 				fillField(f, stmt, colName, i)
 				matched = true
+				filled[colName] = struct{}{}
 				break
 			} else {
 				if f.Kind() == reflect.Struct {
@@ -414,7 +436,10 @@ func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) {
 		}
 		if !matched {
 			for _, field := range structFields {
-				fillStruct(field, stmt, colName, i)
+				if ok := fillStruct(field, stmt, colName, i); ok {
+					filled[colName] = struct{}{}
+					break
+				}
 			}
 		}
 	}
