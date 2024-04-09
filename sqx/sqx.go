@@ -585,21 +585,23 @@ type BulkInserterCommand struct {
 }
 
 type BulkInserter struct {
-	prefix string
-	Size   int
-	count  int
-	mu     sync.Mutex
-	cmds   []BulkInserterCommand
-	conn   *Conn
+	prefix     string
+	onConflict string
+	Size       int
+	count      int
+	mu         sync.Mutex
+	cmds       []BulkInserterCommand
+	conn       *Conn
 }
 
 // NewBulkInserter returns a string builder
 // prefix should be in form of "insert into table
-func NewBulkInserter(prefix string, conn *Conn) *BulkInserter {
+func NewBulkInserter(prefix string, onConflict string, conn *Conn) *BulkInserter {
 	inserter := &BulkInserter{
-		prefix: prefix,
-		Size:   MAX_BINDS,
-		conn:   conn,
+		prefix:     prefix,
+		onConflict: onConflict,
+		Size:       MAX_BINDS,
+		conn:       conn,
 	}
 	return inserter
 }
@@ -614,9 +616,6 @@ func (o *BulkInserter) Add(args ...interface{}) (err error) {
 	// stmt.Exec(args...)
 	// stmt.ClearBindings()
 	numArgs := len(args)
-	if numArgs > o.Size {
-		return ErrArgsGreaterThanSize
-	}
 	cmd := BulkInserterCommand{
 		Args: args,
 	}
@@ -651,6 +650,9 @@ func (o *BulkInserter) commit() (err error) {
 		if i < numCommands-1 {
 			sql.WriteString(", ")
 		}
+	}
+	if o.onConflict != "" {
+		sql.WriteString(fmt.Sprintf(" %s", o.onConflict))
 	}
 	stmt, err := o.conn.Prepare(sql.String())
 	if err != nil {
