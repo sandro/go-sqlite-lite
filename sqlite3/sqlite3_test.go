@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -178,7 +179,15 @@ func TestCreate(T *testing.T) {
 	defer t.skipRestIfFailed()
 
 	checkPath := func(c *Conn, name, want string) {
-		if have := c.FileName(name); have != want {
+		have := c.FileName(name)
+		// Resolve symlinks (e.g. macOS /var -> /private/var) before comparing.
+		if rh, err := filepath.EvalSymlinks(have); err == nil {
+			have = rh
+		}
+		if rw, err := filepath.EvalSymlinks(want); err == nil {
+			want = rw
+		}
+		if have != want {
 			t.Fatalf(cl("c.FileName() expected %q; got %q"), want, have)
 		}
 	}
@@ -819,8 +828,14 @@ func TestSchema(T *testing.T) {
 		}
 	}
 	checkDecls := func(s *Stmt, want ...string) {
-		if have := s.DeclTypes(); !reflect.DeepEqual(have, want) {
+		have := s.DeclTypes()
+		if len(have) != len(want) {
 			t.Fatalf(cl("s.DeclTypes() expected %v; got %v"), want, have)
+		}
+		for i := range want {
+			if !strings.EqualFold(have[i], want[i]) {
+				t.Fatalf(cl("s.DeclTypes() expected %v; got %v"), want, have)
+			}
 		}
 	}
 	s := t.prepare(c, "SELECT * FROM x ORDER BY rowid")

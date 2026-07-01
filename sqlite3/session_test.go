@@ -26,16 +26,16 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
+	"github.com/sandro/go-sqlite-lite/sqlite3"
 )
 
 func initT(t *testing.T, conn *sqlite3.Conn) {
-	err := conn.Exec(`INSERT INTO t (c1, c2, c3) VALUES ("1", "2", "3");`)
+	err := conn.Exec(`INSERT INTO t (c1, c2, c3) VALUES ('1', '2', '3');`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = conn.Exec(`INSERT INTO t (c1, c2, c3) VALUES ("4", "5", "6");`)
+	err = conn.Exec(`INSERT INTO t (c1, c2, c3) VALUES ('4', '5', '6');`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +62,11 @@ func fillSession(t *testing.T) (*sqlite3.Conn, *sqlite3.Session) {
 	}
 
 	stmts := []string{
-		`UPDATE t SET c1="one" WHERE c1="1";`,
-		`UPDATE t SET c2="two", c3="three" WHERE c1="one";`,
-		`UPDATE t SET c1="noop" WHERE c2="2";`,
-		`DELETE FROM t WHERE c1="4";`,
-		`INSERT INTO t (c1, c2, c3) VALUES ("four", "five", "six");`,
+		`UPDATE t SET c1='one' WHERE c1='1';`,
+		`UPDATE t SET c2='two', c3='three' WHERE c1='one';`,
+		`UPDATE t SET c1='noop' WHERE c2='2';`,
+		`DELETE FROM t WHERE c1='4';`,
+		`INSERT INTO t (c1, c2, c3) VALUES ('four', 'five', 'six');`,
 	}
 
 	for _, stmt := range stmts {
@@ -230,8 +230,8 @@ func TestChangesetApply(t *testing.T) {
 	}
 
 	// Table t should now be equivalent to the first two statements:
-	//	INSERT INTO t (c1, c2, c3) VALUES ("1", "2", "3");
-	//	INSERT INTO t (c1, c2, c3) VALUES ("4", "5", "6");
+	//	INSERT INTO t (c1, c2, c3) VALUES ('1', '2', '3');
+	//	INSERT INTO t (c1, c2, c3) VALUES ('4', '5', '6');
 	want := []string{"1,2,3", "4,5,6"}
 	var got []string
 	stmt, err := conn.Prepare("SELECT c1, c2, c3 FROM t ORDER BY c1;")

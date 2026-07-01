@@ -11,7 +11,6 @@ import "C"
 
 import (
 	"io"
-	"runtime"
 )
 
 // ErrBlobFull is returned by BlobIO.Write when there isn't enough space left to
@@ -52,7 +51,9 @@ func newBlobIO(c *Conn, db, tbl, col string, row int64, rw bool) (*BlobIO, error
 		row:  row,
 		len:  int(C.sqlite3_blob_bytes(blob)),
 	}
-	runtime.SetFinalizer(b, (*BlobIO).Close)
+	// No finalizer: the README states that no finalizers are used in this
+	// driver, so that behavior is consistent between debugging and production.
+	// The caller is responsible for closing the BlobIO.
 	return b, nil
 }
 
@@ -66,7 +67,6 @@ func (b *BlobIO) Close() error {
 		b.blob = nil
 		b.len = 0
 		b.off = 0
-		runtime.SetFinalizer(b, nil)
 		if rc := C.sqlite3_blob_close(blob); rc != OK {
 			return libErr(rc, b.conn.db)
 		}

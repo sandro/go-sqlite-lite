@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
+	"github.com/sandro/go-sqlite-lite/sqlite3"
 )
 
 func main() {

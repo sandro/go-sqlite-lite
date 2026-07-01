@@ -232,17 +232,28 @@ func ChangesetIterStart(r io.Reader) (ChangesetIter, error) {
 	// rc := C.sqlite3changeset_start_strm(&iter.ptr, (*[0]byte)(C.strm_r_tramp), unsafe.Pointer(&iter.readerIdx))
 	rc := C.sqlite3changeset_start_strm(&iter.ptr, (*[0]byte)(C.strm_r_tramp), unsafe.Pointer(iter.readerIdx))
 	if rc != OK {
-		return ChangesetIter{}, errStr(rc)
+		// Don't leak the reader registration on error.
+		strmReaderReg.unregister(idx)
+		iter.ptr = nil
+		return iter, errStr(rc)
 	}
 	return iter, nil
 }
 
 // https://www.sqlite.org/session/sqlite3changeset_finalize.html
-func (iter ChangesetIter) Close() error {
+func (iter *ChangesetIter) Close() error {
+	// Conflict iterators passed to ChangesetApply's conflictFn have a nil
+	// readerIdx; SQLite owns their lifetime and finalizes them. Calling Close
+	// on such an iterator is a safe no-op.
+	if iter.ptr == nil || iter.readerIdx == nil {
+		return nil
+	}
 	rc := C.sqlite3changeset_finalize(iter.ptr)
 	iter.ptr = nil
-	strmReaderReg.unregister(*iter.readerIdx)
-	*iter.readerIdx = 0
+	if *iter.readerIdx != 0 {
+		strmReaderReg.unregister(*iter.readerIdx)
+		*iter.readerIdx = 0
+	}
 	if rc != OK {
 		return errStr(rc)
 	}
@@ -321,8 +332,10 @@ func (iter ChangesetIter) PK() ([]bool, error) {
 	if rc != OK {
 		return nil, errStr(rc)
 	}
-	vals := (*[127]byte)(unsafe.Pointer(pabPK))[:pnCol:pnCol]
-	cols := make([]bool, pnCol)
+	// SQLite allows up to 2000 columns (LIMIT_COLUMN), so use unsafe.Slice
+	// instead of a fixed-size array to avoid an out-of-bounds panic.
+	vals := unsafe.Slice((*byte)(unsafe.Pointer(pabPK)), int(pnCol))
+	cols := make([]bool, int(pnCol))
 	for i, val := range vals {
 		if val != 0 {
 			cols[i] = true

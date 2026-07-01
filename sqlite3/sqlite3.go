@@ -23,6 +23,8 @@ package sqlite3
 #cgo CFLAGS: -DSQLITE_ENABLE_FTS5=1
 #cgo CFLAGS: -DSQLITE_ENABLE_GEOPOLY=1
 #cgo CFLAGS: -DSQLITE_ENABLE_JSON1=1
+#cgo CFLAGS: -DSQLITE_ENABLE_MATH_FUNCTIONS=1
+#cgo CFLAGS: -DSQLITE_DQS=0
 #cgo CFLAGS: -DSQLITE_ENABLE_PREUPDATE_HOOK
 #cgo CFLAGS: -DSQLITE_ENABLE_RTREE=1
 #cgo CFLAGS: -DSQLITE_ENABLE_SESSION
@@ -689,13 +691,25 @@ type Stmt struct {
 }
 
 // Close releases all resources associated with the prepared statement. This
-// method can be called at any point in the statement's life cycle.
+// method can be called at any point in the statement's life cycle. It is safe
+// to call Close multiple times.
 // https://www.sqlite.org/c3ref/finalize.html
 func (s *Stmt) Close() error {
-	rc := C.sqlite3_finalize(s.stmt)
+	if s.stmt == nil {
+		return nil
+	}
+	stmt := s.stmt
 	s.stmt = nil
+	db := s.db
+	s.db = nil
+	rc := C.sqlite3_finalize(stmt)
 	if rc != OK {
-		return libErr(rc, s.db)
+		// Avoid calling sqlite3_errmsg on a db that may have already been
+		// closed/finalized by Conn.Close; fall back to the generic message.
+		if db != nil && rc == C.sqlite3_errcode(db) {
+			return &Error{int(rc), C.GoString(C.sqlite3_errmsg(db))}
+		}
+		return &Error{int(rc), C.GoString(C.sqlite3_errstr(rc))}
 	}
 	return nil
 }
@@ -849,6 +863,14 @@ func (s *Stmt) Bind(args ...interface{}) error {
 			rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 0)
 		case ZeroBlob:
 			rc = C.sqlite3_bind_zeroblob(s.stmt, C.int(i+1), C.int(v))
+		case time.Time:
+			// Store instants as milliseconds since the Unix epoch. This keeps
+			// values within int64 range and round-trips cleanly for the common
+			// case. Callers needing higher precision should bind int64/float64
+			// or text explicitly.
+			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v.UnixNano()/1e6))
+		case time.Duration:
+			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(int64(v)))
 		case NamedArgs:
 			if i != 0 || len(args) != 1 {
 				return pkgErr(MISUSE, "NamedArgs must be used as the only argument to Bind()")
@@ -958,6 +980,10 @@ func (s *Stmt) bindNamed(args NamedArgs) error {
 			rc = C.bind_blob(s.stmt, i, cBytes(v), C.int(len(v)), 0)
 		case ZeroBlob:
 			rc = C.sqlite3_bind_zeroblob(s.stmt, i, C.int(v))
+		case time.Time:
+			rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(v.UnixNano()/1e6))
+		case time.Duration:
+			rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(int64(v)))
 		default:
 			return pkgErr(MISUSE, "unsupported type for %s (%T)", name, v)
 		}
