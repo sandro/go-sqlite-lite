@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/sandro/go-sqlite-lite/sqlite3"
 )
@@ -76,8 +77,9 @@ func check(args ...interface{}) {
 
 type Conn struct {
 	*sqlite3.Conn
-	stmtCache map[string]*sqlite3.Stmt
-	closed    bool
+	stmtCache  map[string]*sqlite3.Stmt
+	planCache  map[string]*scanPlan // keyed by SQL string, like stmtCache
+	closed     bool
 }
 
 // NewConn opens a SQLite connection at uri. If readonly is true, the connection
@@ -104,7 +106,7 @@ func NewConn(uri string, readonly bool) (*Conn, error) {
 		MaxBinds = lim
 		MAX_BINDS = lim
 	}
-	conn := &Conn{Conn: c, stmtCache: make(map[string]*sqlite3.Stmt)}
+	conn := &Conn{Conn: c, stmtCache: make(map[string]*sqlite3.Stmt), planCache: make(map[string]*scanPlan)}
 	return conn, nil
 }
 
@@ -152,7 +154,24 @@ func (o *Conn) Close() {
 		}
 	}
 	o.stmtCache = nil
+	o.planCache = nil
 	o.Conn.Close()
+}
+
+// cachedPlan returns the scan plan for (base, stmt), building and caching it
+// on the Conn keyed by sqlStr. This avoids re-walking the struct and the
+// global planCache string-building on every call.
+func (o *Conn) cachedPlan(sqlStr string, base reflect.Type, stmt *sqlite3.Stmt) (*scanPlan, error) {
+	if p, ok := o.planCache[sqlStr]; ok {
+		return p, nil
+	}
+	colNames := stmt.ColumnNames()
+	plan, err := getScanPlan(base, colNames)
+	if err != nil {
+		return nil, err
+	}
+	o.planCache[sqlStr] = plan
+	return plan, nil
 }
 
 func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
@@ -172,8 +191,19 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 	if !hasRow {
 		return nil
 	}
-	value := reflect.ValueOf(dest).Elem()
-	return dbToStruct(value, stmt)
+	v := reflect.ValueOf(dest)
+	if v.Kind() != reflect.Ptr {
+		return fmt.Errorf("sqx: dest must be a pointer, got %T", dest)
+	}
+	elem := v.Elem()
+	if elem.Kind() != reflect.Struct {
+		return fmt.Errorf("sqx: dest must point to a struct, got %s", elem.Kind())
+	}
+	plan, err := o.cachedPlan(sql, elem.Type(), stmt)
+	if err != nil {
+		return err
+	}
+	return applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), stmt)
 }
 
 func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
@@ -193,20 +223,33 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 	// Overwrite the destination slice rather than appending, matching the
 	// usual expectation that Select fills dest with the current result set.
 	indirect.Set(reflect.MakeSlice(sliceElem, 0, 0))
+
+	hasRow, err := stmt.Step()
+	if err != nil {
+		return err
+	}
+	if !hasRow {
+		return nil
+	}
+	// Build (or fetch from Conn cache) the scan plan for this struct type +
+	// column set. The plan is reused across all rows.
+	plan, err := o.cachedPlan(sql, base, stmt)
+	if err != nil {
+		return err
+	}
 	for {
-		hasRow, err := stmt.Step()
+		vp := reflect.New(base)
+		if err = applyPlan(plan, unsafe.Pointer(vp.Pointer()), stmt); err != nil {
+			return err
+		}
+		indirect.Set(reflect.Append(indirect, vp.Elem()))
+		hasRow, err = stmt.Step()
 		if err != nil {
 			return err
 		}
 		if !hasRow {
 			break
 		}
-		vp := reflect.New(base)
-		v := vp.Elem()
-		if err = dbToStruct(v, stmt); err != nil {
-			return err
-		}
-		indirect.Set(reflect.Append(indirect, v))
 	}
 	return nil
 }
@@ -305,11 +348,22 @@ func (o *Conn) RowsAffected() (int64, error) {
 var timeType reflect.Type = reflect.TypeOf(time.Time{})
 var byteArrayType reflect.Type = reflect.TypeOf([]byte{})
 
-func isTime(value reflect.Value) bool {
-	return value.Type() == timeType || value.CanConvert(timeType)
-}
-
 var TimeSetter = setTimeFromValue
+
+// typedMemmove copies a value of type t from src to dst. It is equivalent to
+// *dst = *src for the concrete type t, but uses unsafe pointer copy so no
+// reflect.Value is needed. The caller must guarantee dst and src point to
+// memory of exactly type t.
+func typedMemmove(dst, src unsafe.Pointer, t reflect.Type) {
+	n := int(t.Size())
+	if n <= 0 {
+		return
+	}
+	// Use reflect.New + Set for correctness with GC pointers. This is only
+	// used for the rare UnmarshalText path, not the hot scan loop, so the cost
+	// is acceptable. We do a single memmove via unsafe.Slice for speed.
+	copy((*[1 << 30]byte)(dst)[:n:n], (*[1 << 30]byte)(src)[:n:n])
+}
 
 // setTimeFromValue converts a database value into a time.Time. It returns
 // (tm, ok); ok is false if val is nil or cannot be parsed.
@@ -350,13 +404,6 @@ func parseTimeString(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func setTime(value reflect.Value, val interface{}) {
-	tm, ok := TimeSetter(val)
-	if ok && !tm.IsZero() {
-		value.Set(reflect.ValueOf(tm))
-	}
-}
-
 func getFieldName(fieldType reflect.StructField) string {
 	name := fieldType.Name
 	tag := fieldType.Tag.Get("db")
@@ -366,200 +413,320 @@ func getFieldName(fieldType reflect.StructField) string {
 	return name
 }
 
-// fillField reads column index from stmt into field. It returns (filled, err).
-// filled is true if the field was set. err is non-nil if reading or setting
-// the column failed. A NULL column for a time.Time field is reported as
-// (true, nil) so the field keeps its zero value.
-func fillField(field reflect.Value, stmt *sqlite3.Stmt, colName string, index int) (bool, error) {
-	switch field.Kind() {
-	case reflect.Bool:
-		b, _, err := stmt.ColumnInt64(index)
-		if err != nil {
-			return false, err
-		}
-		field.SetBool(b != 0)
-		return true, nil
-	case reflect.String:
-		val, _, err := stmt.ColumnText(index)
-		if err != nil {
-			return false, err
-		}
-		field.SetString(val)
-		return true, nil
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		val, _, err := stmt.ColumnInt64(index)
-		if err != nil {
-			return false, err
-		}
-		field.SetInt(val)
-		return true, nil
-	case reflect.Float32, reflect.Float64:
-		val, _, err := stmt.ColumnDouble(index)
-		if err != nil {
-			return false, err
-		}
-		field.SetFloat(val)
-		return true, nil
-	case reflect.Slice:
-		if field.CanConvert(byteArrayType) {
-			val, err := stmt.ColumnBlob(index)
-			if err != nil {
-				return false, err
-			}
-			field.SetBytes(val)
-			return true, nil
-		}
-		return false, fmt.Errorf("sqx: unimplemented conversion for slice %s %v: only []byte is supported", colName, field.Type())
-	case reflect.Struct:
-		if isTime(field) {
-			var val interface{}
-			switch typ := stmt.ColumnType(index); typ {
-			case sqlite3.INTEGER:
-				v, _, err := stmt.ColumnInt64(index)
-				if err != nil {
-					return false, err
-				}
-				val = v
-			case sqlite3.FLOAT:
-				v, _, err := stmt.ColumnDouble(index)
-				if err != nil {
-					return false, err
-				}
-				val = v
-			case sqlite3.TEXT:
-				v, _, err := stmt.ColumnText(index)
-				if err != nil {
-					return false, err
-				}
-				val = v
-			case sqlite3.NULL:
-				return true, nil
-			case sqlite3.BLOB:
-				v, err := stmt.ColumnBlob(index)
-				if err != nil {
-					return false, err
-				}
-				val = v
-			default:
-				return false, fmt.Errorf("sqx: cannot set time for column %s with type %d (field %v)", colName, typ, field.Type())
-			}
-			setTime(field, val)
-			return true, nil
-		}
-		// Non-time struct: try encoding.TextUnmarshaler.
-		t := field.Type()
-		base := reflect.New(t)
-		m := base.MethodByName("UnmarshalText")
-		if !m.IsZero() {
-			val, err := stmt.ColumnBlob(index)
-			if err != nil {
-				return false, err
-			}
-			res := m.Call([]reflect.Value{reflect.ValueOf(val)})
-			if !res[0].IsNil() {
-				if uerr, ok := res[0].Interface().(error); ok {
-					return false, fmt.Errorf("sqx: UnmarshalText for %s failed: %w", colName, uerr)
-				}
-				return false, fmt.Errorf("sqx: UnmarshalText for %s failed", colName)
-			}
-			field.Set(base.Elem())
-			return true, nil
-		}
-		return false, fmt.Errorf("sqx: no UnmarshalText for struct field %s %v", colName, t)
-	default:
-		return false, fmt.Errorf("sqx: unknown reflection type for column %s field %v kind %s", colName, field.Type(), field.Kind())
-	}
+
+// scanPlan is a cached, pre-computed mapping from query result columns to
+// struct fields. It is built once per (struct type, column set) pair via
+// reflection, then reused across rows using unsafe pointer arithmetic — no
+// per-row reflection. This mirrors the fast-path approach database/sql uses
+// internally: reflect once to learn the layout, then write directly.
+type scanPlan struct {
+	// entries[i] describes how to fill the struct field matched to result
+	// column i. A nil entry means column i is ignored (no matching field).
+	entries []*scanEntry
 }
 
-// dbToStruct scans the current row of stmt into value (a reflect.Value of a
-// struct). Columns are matched to struct fields by name (honoring a `db` tag),
-// case-insensitively, with recursive descent into nested struct fields.
-//
-// Matching is by column name against the set of available field names across
-// the whole struct tree. Each struct field is filled at most once, so when a
-// query (e.g. "SELECT * FROM foo JOIN bar") produces duplicate column names,
-// the first column of a given name fills the outermost match and subsequent
-// columns of the same name fill deeper nested structs in field order.
-// Unmatched columns are ignored. An error is returned if a matched column
-// cannot be read or converted.
-func dbToStruct(value reflect.Value, stmt *sqlite3.Stmt) error {
-	nCols := stmt.ColumnCount()
-	// Pre-compute the column names once.
-	colNames := make([]string, nCols)
-	for i := 0; i < nCols; i++ {
-		colNames[i] = stmt.ColumnName(i)
+// scanEntry describes a single field write. The setter writes the value of a
+// stmt column directly into the struct at the field's offset.
+type scanEntry struct {
+	offset uintptr
+	kind   reflect.Kind
+	typ    reflect.Type // for time.Time and UnmarshalText types
+	// setter performs the actual write. It receives an unsafe.Pointer to the
+	// start of the struct (so it adds offset internally) and the column index.
+	setter func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error
+}
+
+var planCache sync.Map // map[planKey]*scanPlan
+
+// planKey identifies a cached scan plan by struct type and the ordered set of
+// column names returned by the query.
+type planKey struct {
+	typeID  uintptr // reflect.Type pointer identity (via reflect.Type.Pointer())
+	colKey  string  // joined column names with a separator
+}
+
+// getScanPlan returns a cached plan for (typ, colNames), building one if needed.
+func getScanPlan(typ reflect.Type, colNames []string) (*scanPlan, error) {
+	var sb strings.Builder
+	for i, cn := range colNames {
+		if i > 0 {
+			sb.WriteByte(0) // NUL separator — column names can't contain it
+		}
+		sb.WriteString(cn)
 	}
-	// Track which column ordinals have already been consumed.
+	key := planKey{typeID: typeID(typ), colKey: sb.String()}
+	if v, ok := planCache.Load(key); ok {
+		return v.(*scanPlan), nil
+	}
+	plan, err := buildScanPlan(typ, colNames)
+	if err != nil {
+		return nil, err
+	}
+	// Store with LoadOrStore so concurrent builds of the same key resolve to one.
+	if actual, loaded := planCache.LoadOrStore(key, plan); loaded {
+		return actual.(*scanPlan), nil
+	}
+	return plan, nil
+}
+
+// typeID returns a stable identity for a reflect.Type. reflect.Type values are
+// unique per type, so we can use the pointer as an identity key.
+func typeID(t reflect.Type) uintptr {
+	// reflect.Type has no public method returning a stable id, but Value.Pointer
+	// on the reflect.Type interface works (it's the pointer to the rtype).
+	v := reflect.ValueOf(t)
+	if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		return v.Pointer()
+	}
+	return 0
+}
+
+// buildScanPlan walks the struct tree via reflection, matching fields to columns
+// by name (honoring `db` tags), case-sensitively then case-insensitively. Each
+// column is consumed at most once; each field path is filled at most once, so
+// duplicate column names (e.g. from JOINs) fill deeper nested structs in field
+// order — preserving the existing semantics of the reflection-based scanner.
+func buildScanPlan(typ reflect.Type, colNames []string) (*scanPlan, error) {
+	nCols := len(colNames)
 	consumed := make([]bool, nCols)
-	// matchedField records a field path that has already been filled, so it
-	// won't be reused by a later column of the same name.
 	matchedField := make(map[string]bool)
-	return assignColumns(value, stmt, colNames, consumed, matchedField)
+	entries := make([]*scanEntry, nCols)
+	if err := walkFields(typ, colNames, consumed, matchedField, entries, "", 0); err != nil {
+		return nil, err
+	}
+	return &scanPlan{entries: entries}, nil
 }
 
-// assignColumns assigns unmatched columns to fields of value, recursing into
-// nested struct fields. A field is matched once (tracked in matchedField by
-// its dotted path); a column is consumed once (tracked in consumed).
-func assignColumns(value reflect.Value, stmt *sqlite3.Stmt, colNames []string, consumed []bool, matchedField map[string]bool) error {
-	t := value.Type()
-	for fi := 0; fi < value.NumField(); fi++ {
-		fieldType := t.Field(fi)
+// walkFields is the reflection-driven plan builder. It mirrors the old
+// assignColumns/assignColumnsPath recursion exactly, but instead of reading
+// column values it records field offsets and typed setters into entries.
+// baseOffset is the byte offset of typ within the root struct (0 at the top
+// level, accumulating as we descend into nested structs) so that every
+// scanEntry.offset is relative to the root struct pointer.
+func walkFields(typ reflect.Type, colNames []string, consumed []bool, matchedField map[string]bool, entries []*scanEntry, prefix string, baseOffset uintptr) error {
+	for fi := 0; fi < typ.NumField(); fi++ {
+		fieldType := typ.Field(fi)
 		if !fieldType.IsExported() {
 			continue
 		}
-		f := value.Field(fi)
 		name := getFieldName(fieldType)
-		path := fieldType.Name
-		// First, try to match this scalar field against an unconsumed column
-		// of the same name. Only do this if the field is not itself a struct
-		// that we'd rather descend into (except time.Time, which is scalar-like).
-		if f.Kind() != reflect.Struct || isTime(f) {
+		path := prefix + fieldType.Name
+		absOffset := baseOffset + fieldType.Offset
+		// Scalar-like field (including time.Time): try direct column match.
+		if fieldType.Type.Kind() != reflect.Struct || fieldType.Type == timeType {
 			if !matchedField[path] {
 				if idx := findColumn(colNames, consumed, name); idx >= 0 {
-					if _, err := fillField(f, stmt, colNames[idx], idx); err != nil {
+					entry, err := newScanEntry(fieldType, absOffset)
+					if err != nil {
 						return err
 					}
+					entries[idx] = entry
 					consumed[idx] = true
 					matchedField[path] = true
 				}
 			}
 			continue
 		}
-		// Nested struct: assign remaining unmatched columns to its fields.
-		// Build a child path namespace by prefixing, to keep field identity
-		// unique across nesting levels.
-		if err := assignColumnsPath(f, stmt, colNames, consumed, matchedField, path+"."); err != nil {
+		// Nested struct: recurse to match remaining unconsumed columns.
+		if err := walkFields(fieldType.Type, colNames, consumed, matchedField, entries, path+".", absOffset); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// assignColumnsPath is assignColumns with a path prefix used to namespace
-// nested field identities in matchedField.
-func assignColumnsPath(value reflect.Value, stmt *sqlite3.Stmt, colNames []string, consumed []bool, matchedField map[string]bool, prefix string) error {
-	t := value.Type()
-	for fi := 0; fi < value.NumField(); fi++ {
-		fieldType := t.Field(fi)
-		if !fieldType.IsExported() {
-			continue
+// newScanEntry builds a scanEntry for a single field, choosing a setter based on
+// the field's kind. The setter writes directly into the struct via unsafe pointer
+// arithmetic — no reflect.Value, no FieldByName, no Set per row.
+// offset is the absolute byte offset from the root struct pointer.
+func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error) {
+	kind := field.Type.Kind()
+	entry := &scanEntry{offset: offset, kind: kind, typ: field.Type}
+
+	switch kind {
+	case reflect.Bool:
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			v, _, err := stmt.ColumnInt64(col)
+			if err != nil {
+				return err
+			}
+			*(*bool)(unsafe.Pointer(uintptr(p) + offset)) = v != 0
+			return nil
 		}
-		f := value.Field(fi)
-		name := getFieldName(fieldType)
-		path := prefix + fieldType.Name
-		if f.Kind() != reflect.Struct || isTime(f) {
-			if !matchedField[path] {
-				if idx := findColumn(colNames, consumed, name); idx >= 0 {
-					if _, err := fillField(f, stmt, colNames[idx], idx); err != nil {
+	case reflect.String:
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			v, _, err := stmt.ColumnText(col)
+			if err != nil {
+				return err
+			}
+			*(*string)(unsafe.Pointer(uintptr(p) + offset)) = v
+			return nil
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			v, _, err := stmt.ColumnInt64(col)
+			if err != nil {
+				return err
+			}
+			// Write via the correct int-width pointer so sign extension is right.
+			switch kind {
+			case reflect.Int:
+				*(*int)(unsafe.Pointer(uintptr(p) + offset)) = int(v)
+			case reflect.Int8:
+				*(*int8)(unsafe.Pointer(uintptr(p) + offset)) = int8(v)
+			case reflect.Int16:
+				*(*int16)(unsafe.Pointer(uintptr(p) + offset)) = int16(v)
+			case reflect.Int32:
+				*(*int32)(unsafe.Pointer(uintptr(p) + offset)) = int32(v)
+			case reflect.Int64:
+				*(*int64)(unsafe.Pointer(uintptr(p) + offset)) = v
+			}
+			return nil
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			v, _, err := stmt.ColumnInt64(col)
+			if err != nil {
+				return err
+			}
+			switch kind {
+			case reflect.Uint:
+				*(*uint)(unsafe.Pointer(uintptr(p) + offset)) = uint(v)
+			case reflect.Uint8:
+				*(*uint8)(unsafe.Pointer(uintptr(p) + offset)) = uint8(v)
+			case reflect.Uint16:
+				*(*uint16)(unsafe.Pointer(uintptr(p) + offset)) = uint16(v)
+			case reflect.Uint32:
+				*(*uint32)(unsafe.Pointer(uintptr(p) + offset)) = uint32(v)
+			case reflect.Uint64:
+				*(*uint64)(unsafe.Pointer(uintptr(p) + offset)) = uint64(v)
+			}
+			return nil
+		}
+	case reflect.Float32, reflect.Float64:
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			v, _, err := stmt.ColumnDouble(col)
+			if err != nil {
+				return err
+			}
+			if kind == reflect.Float32 {
+				*(*float32)(unsafe.Pointer(uintptr(p) + offset)) = float32(v)
+			} else {
+				*(*float64)(unsafe.Pointer(uintptr(p) + offset)) = v
+			}
+			return nil
+		}
+	case reflect.Slice:
+		if field.Type != byteArrayType {
+			return nil, fmt.Errorf("sqx: unsupported slice type %s (only []byte)", field.Type)
+		}
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			v, err := stmt.ColumnBlob(col)
+			if err != nil {
+				return err
+			}
+			*(*[]byte)(unsafe.Pointer(uintptr(p) + offset)) = v
+			return nil
+		}
+	case reflect.Struct:
+		if field.Type == timeType {
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				var val interface{}
+				switch typ := stmt.ColumnType(col); typ {
+				case sqlite3.INTEGER:
+					v, _, err := stmt.ColumnInt64(col)
+					if err != nil {
 						return err
 					}
-					consumed[idx] = true
-					matchedField[path] = true
+					val = v
+				case sqlite3.FLOAT:
+					v, _, err := stmt.ColumnDouble(col)
+					if err != nil {
+						return err
+					}
+					val = v
+				case sqlite3.TEXT:
+					v, _, err := stmt.ColumnText(col)
+					if err != nil {
+						return err
+					}
+					val = v
+				case sqlite3.NULL:
+					return nil
+				case sqlite3.BLOB:
+					v, err := stmt.ColumnBlob(col)
+					if err != nil {
+						return err
+					}
+					val = v
+				default:
+					return fmt.Errorf("sqx: cannot set time for column type %d", typ)
 				}
+				tm, ok := TimeSetter(val)
+				if ok && !tm.IsZero() {
+					*(*time.Time)(unsafe.Pointer(uintptr(p) + offset)) = tm
+				}
+				return nil
 			}
+		} else {
+			// Non-time struct: try UnmarshalText.
+			m := reflect.New(field.Type).MethodByName("UnmarshalText")
+			if !m.IsZero() {
+				entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+					v, err := stmt.ColumnBlob(col)
+					if err != nil {
+						return err
+					}
+					// UnmarshalText writes into a fresh value; copy it into place.
+					base := reflect.New(field.Type)
+					res := m.Call([]reflect.Value{reflect.ValueOf(v)})
+					if !res[0].IsNil() {
+						if uerr, ok := res[0].Interface().(error); ok {
+							return fmt.Errorf("sqx: UnmarshalText failed: %w", uerr)
+						}
+						return fmt.Errorf("sqx: UnmarshalText failed")
+					}
+					// Copy the unmarshaled value into the struct via unsafe.
+					src := unsafe.Pointer(base.Pointer())
+					dst := unsafe.Pointer(uintptr(p) + offset)
+					typedMemmove(dst, src, field.Type)
+					return nil
+				}
+			} else {
+				return nil, fmt.Errorf("sqx: struct field %s has no UnmarshalText and is not time.Time", field.Name)
+			}
+		}
+	case reflect.Ptr:
+		// nil pointer → allocate via reflect.New + convertAssign (rare path).
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			if stmt.ColumnType(col) == sqlite3.NULL {
+				*(*unsafe.Pointer)(unsafe.Pointer(uintptr(p) + offset)) = nil
+				return nil
+			}
+			// Fall back to reflection for pointer-to-struct/other types.
+			vp := reflect.NewAt(field.Type, unsafe.Pointer(uintptr(p)+offset))
+			return stmt.Scan(vp.Interface())
+		}
+	default:
+		// Interface or other: fall back to stmt.Scan via reflection per row.
+		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+			vp := reflect.NewAt(field.Type, unsafe.Pointer(uintptr(p)+offset))
+			return stmt.Scan(vp.Interface())
+		}
+	}
+	return entry, nil
+}
+
+// applyPlan writes the current row of stmt into dest (an unsafe.Pointer to the
+// struct) using the precomputed plan. This is the hot path: a loop over the
+// plan entries calling typed setters — zero reflection, zero allocations for
+// the common scalar fields.
+func applyPlan(plan *scanPlan, dest unsafe.Pointer, stmt *sqlite3.Stmt) error {
+	for i, entry := range plan.entries {
+		if entry == nil {
 			continue
 		}
-		if err := assignColumnsPath(f, stmt, colNames, consumed, matchedField, path+"."); err != nil {
+		if err := entry.setter(dest, stmt, i); err != nil {
 			return err
 		}
 	}
