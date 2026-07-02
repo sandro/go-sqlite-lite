@@ -243,6 +243,7 @@ int sqlite3_blocking_prepare_v2(
 import "C"
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"io"
 	"os"
@@ -831,57 +832,76 @@ func (s *Stmt) Exec(args ...interface{}) error {
 // type of arguments passed
 func (s *Stmt) Bind(args ...interface{}) error {
 	for i, v := range args {
-		var rc C.int
 		if v == nil {
-			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+			rc := C.sqlite3_bind_null(s.stmt, C.int(i+1))
 			if rc != OK {
 				return errStr(rc)
 			}
 			continue
 		}
-		switch v := v.(type) {
-		case int:
-			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v))
-		case int64:
-			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v))
-		case float64:
-			rc = C.sqlite3_bind_double(s.stmt, C.int(i+1), C.double(v))
-		case bool:
-			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(cBool(v)))
-		case string:
-			rc = C.bind_text(s.stmt, C.int(i+1), cStr(v), C.int(len(v)), 1)
-		case []byte:
-			// This is a strange case.  nil byte arrays should be treated as inserting NULL
-			if []byte(v) == nil {
-				rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
-			} else {
-				rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 1)
-			}
-		case RawString:
-			rc = C.bind_text(s.stmt, C.int(i+1), cStr(string(v)), C.int(len(v)), 0)
-		case RawBytes:
-			rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 0)
-		case ZeroBlob:
-			rc = C.sqlite3_bind_zeroblob(s.stmt, C.int(i+1), C.int(v))
-		case time.Time:
-			// Store instants as milliseconds since the Unix epoch. This keeps
-			// values within int64 range and round-trips cleanly for the common
-			// case. Callers needing higher precision should bind int64/float64
-			// or text explicitly.
-			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v.UnixNano()/1e6))
-		case time.Duration:
-			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(int64(v)))
-		case NamedArgs:
-			if i != 0 || len(args) != 1 {
-				return pkgErr(MISUSE, "NamedArgs must be used as the only argument to Bind()")
-			}
-			return s.bindNamed(v)
-		default:
-			return pkgErr(MISUSE, "unsupported type at index %d (%T)", i, v)
+		if err := s.bindValue(i, v, args); err != nil {
+			return err
 		}
-		if rc != OK {
-			return errStr(rc)
+	}
+	return nil
+}
+
+// bindValue binds a single argument at position i (0-indexed). args is passed
+// only for the NamedArgs edge case that requires checking position and length.
+func (s *Stmt) bindValue(i int, v interface{}, args []interface{}) error {
+	var rc C.int
+	switch v := v.(type) {
+	case int:
+		rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v))
+	case int64:
+		rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v))
+	case float64:
+		rc = C.sqlite3_bind_double(s.stmt, C.int(i+1), C.double(v))
+	case bool:
+		rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(cBool(v)))
+	case string:
+		rc = C.bind_text(s.stmt, C.int(i+1), cStr(v), C.int(len(v)), 1)
+	case []byte:
+		// This is a strange case.  nil byte arrays should be treated as inserting NULL
+		if []byte(v) == nil {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		} else {
+			rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 1)
 		}
+	case RawString:
+		rc = C.bind_text(s.stmt, C.int(i+1), cStr(string(v)), C.int(len(v)), 0)
+	case RawBytes:
+		rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 0)
+	case ZeroBlob:
+		rc = C.sqlite3_bind_zeroblob(s.stmt, C.int(i+1), C.int(v))
+	case time.Time:
+		// Store instants as milliseconds since the Unix epoch. This keeps
+		// values within int64 range and round-trips cleanly for the common
+		// case. Callers needing higher precision should bind int64/float64
+		// or text explicitly.
+		rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v.UnixNano()/1e6))
+	case time.Duration:
+		rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(int64(v)))
+	case NamedArgs:
+		if i != 0 || len(args) != 1 {
+			return pkgErr(MISUSE, "NamedArgs must be used as the only argument to Bind()")
+		}
+		return s.bindNamed(v)
+	case driver.Valuer:
+		val, err := v.Value()
+		if err != nil {
+			return pkgErr(MISUSE, "Valuer.Value() at index %d failed: %w", i, err)
+		}
+		if val == nil {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		} else {
+			return s.bindValue(i, val, nil)
+		}
+	default:
+		return pkgErr(MISUSE, "unsupported type at index %d (%T)", i, v)
+	}
+	if rc != OK {
+		return errStr(rc)
 	}
 	return nil
 }
@@ -984,6 +1004,17 @@ func (s *Stmt) bindNamed(args NamedArgs) error {
 			rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(v.UnixNano()/1e6))
 		case time.Duration:
 			rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(int64(v)))
+		case driver.Valuer:
+			val, err := v.Value()
+			if err != nil {
+				return pkgErr(MISUSE, "Valuer.Value() for %s failed: %w", name, err)
+			}
+			if val == nil {
+				rc = C.sqlite3_bind_null(s.stmt, i)
+			} else {
+				// Re-bind the resolved value via the unnamed path.
+				return s.bindValue(int(i)-1, val, nil)
+			}
 		default:
 			return pkgErr(MISUSE, "unsupported type for %s (%T)", name, v)
 		}

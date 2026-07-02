@@ -1179,6 +1179,15 @@ func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	return db.Get(dest, sql, args...)
 }
 
+func (o *DBPool) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
+	db := o.Checkout()
+	if db == nil {
+		return nil, ErrPoolClosed
+	}
+	defer o.Checkin(db)
+	return db.GetVersions(query, args...)
+}
+
 func (o *DBPool) Query(sql string, args []interface{}, f func(row *Row) error) error {
 	db := o.Checkout()
 	if db == nil {
