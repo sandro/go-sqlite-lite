@@ -118,10 +118,10 @@ func (t T) step(s *Stmt, wantRow bool) {
 func (t T) stepErr(s *Stmt) {
 	haveRow, haveErr := s.Step()
 	if haveErr == nil {
-		t.Fatalf(cl("s.Step() expected an error; got success"))
+		t.Fatalf("%s", cl("s.Step() expected an error; got success"))
 	}
 	if haveRow {
-		t.Fatalf(cl("s.Step() expected an error; which it got, but it also got a row"))
+		t.Fatalf("%s", cl("s.Step() expected an error; which it got, but it also got a row"))
 	}
 }
 
@@ -314,7 +314,7 @@ func TestScan(T *testing.T) {
 			if !reflect.DeepEqual(have.Writer, want.Writer) {
 				t.Errorf(cl("not deep equal:  expected\n%#v; got\n%#v"), want.Writer, have.Writer)
 			}
-			t.Fatalf(cl("Failed"))
+			t.Fatalf("%s", cl("Failed"))
 		}
 		skipCols = append(skipCols, nil)
 	}
@@ -331,7 +331,7 @@ func TestScan(T *testing.T) {
 	t.step(s, true)
 
 	// Verify data types
-	wantT := []uint8{NULL, TEXT, BLOB, INTEGER, FLOAT, FLOAT, INTEGER, TEXT, BLOB}
+	wantT := []uint8{SQLITE_NULL, SQLITE_TEXT, SQLITE_BLOB, SQLITE_INTEGER, SQLITE_FLOAT, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_TEXT, SQLITE_BLOB}
 	if haveT := s.ColumnTypes(); !reflect.DeepEqual(haveT, wantT) {
 		t.Fatalf(cl("s.ColumnTypes() expected %v; got %v"), wantT, haveT)
 	}
@@ -533,15 +533,15 @@ func TestParams(T *testing.T) {
 	dt := func(v interface{}) uint8 {
 		switch v.(type) {
 		case int64:
-			return INTEGER
+			return SQLITE_INTEGER
 		case float64:
-			return FLOAT
+			return SQLITE_FLOAT
 		case string:
-			return TEXT
+			return SQLITE_TEXT
 		case []byte:
-			return BLOB
+			return SQLITE_BLOB
 		}
-		return NULL
+		return SQLITE_NULL
 	}
 	verify := func(_a, _b, _c, _d interface{}) {
 		s := t.prepare(c, "SELECT * FROM x ORDER BY rowid LIMIT 1")

@@ -27,5 +27,5 @@ After copying, verify:
 ```sh
 grep SQLITE_VERSION sqlite3/sqlite3.h      # should show the new version
 grep -c SQLITE_ENABLE_UPDATE_DELETE_LIMIT sqlite3/sqlite3.c  # should be > 0
-go test ./sqlite3/ ./sqx/
+go test ./sqlite3/ ./slite/
 ```

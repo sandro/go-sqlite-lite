@@ -9,14 +9,15 @@ package sqlite3
 */
 import "C"
 
-// Fundamental SQLite data types. These are returned by Stmt.DataTypes method.
+// Fundamental SQLite data types. These are returned by Stmt.ColumnType and
+// Stmt.ColumnTypes methods.
 // https://www.sqlite.org/c3ref/c_blob.html
 const (
-	INTEGER = C.SQLITE_INTEGER // 1
-	FLOAT   = C.SQLITE_FLOAT   // 2
-	TEXT    = C.SQLITE_TEXT    // 3
-	BLOB    = C.SQLITE_BLOB    // 4
-	NULL    = C.SQLITE_NULL    // 5
+	SQLITE_INTEGER = C.SQLITE_INTEGER // 1
+	SQLITE_FLOAT   = C.SQLITE_FLOAT   // 2
+	SQLITE_TEXT    = C.SQLITE_TEXT    // 3
+	SQLITE_BLOB    = C.SQLITE_BLOB    // 4
+	SQLITE_NULL    = C.SQLITE_NULL    // 5
 )
 
 // Flags that can be provided to Open

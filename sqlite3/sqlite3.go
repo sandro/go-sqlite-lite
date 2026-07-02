@@ -1104,15 +1104,15 @@ func (s *Stmt) scan(i int, v interface{}) error {
 func (s *Stmt) scanDynamic(i int, v *interface{}) error {
 	var err error
 	switch typ := s.ColumnType(int(i)); typ {
-	case INTEGER:
+	case SQLITE_INTEGER:
 		*v, _, err = s.ColumnInt64(i)
-	case FLOAT:
+	case SQLITE_FLOAT:
 		*v, _, err = s.ColumnDouble(i)
-	case TEXT:
+	case SQLITE_TEXT:
 		*v, _, err = s.ColumnText(i)
-	case BLOB:
+	case SQLITE_BLOB:
 		*v, err = s.ColumnBlob(i)
-	case NULL:
+	case SQLITE_NULL:
 		*v = nil
 	default:
 		*v = nil
@@ -1132,7 +1132,7 @@ func (s *Stmt) ColumnBlob(i int) (val []byte, err error) {
 	if i >= len(s.colTypes) {
 		return nil, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return nil, nil
 	}
 
@@ -1159,7 +1159,7 @@ func (s *Stmt) ColumnDouble(i int) (val float64, ok bool, err error) {
 	if i >= len(s.colTypes) {
 		return 0.0, false, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return 0.0, false, nil
 	}
 
@@ -1175,7 +1175,7 @@ func (s *Stmt) ColumnInt(i int) (val int, ok bool, err error) {
 	if i >= len(s.colTypes) {
 		return 0, false, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return 0, false, nil
 	}
 
@@ -1191,7 +1191,7 @@ func (s *Stmt) ColumnInt64(i int) (val int64, ok bool, err error) {
 	if i >= len(s.colTypes) {
 		return 0, false, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return 0, false, nil
 	}
 
@@ -1207,7 +1207,7 @@ func (s *Stmt) ColumnText(i int) (val string, ok bool, err error) {
 	if i >= len(s.colTypes) {
 		return "", false, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return "", false, nil
 	}
 
@@ -1249,7 +1249,7 @@ func (s *Stmt) ColumnRawBytes(i int) (val RawBytes, err error) {
 	if i >= len(s.colTypes) {
 		return nil, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return nil, nil
 	}
 
@@ -1279,7 +1279,7 @@ func (s *Stmt) ColumnRawString(i int) (val RawString, ok bool, err error) {
 	if i >= len(s.colTypes) {
 		return "", false, errStr(RANGE)
 	}
-	if s.colTypes[i] == NULL {
+	if s.colTypes[i] == SQLITE_NULL {
 		return "", false, nil
 	}
 

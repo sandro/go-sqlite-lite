@@ -68,7 +68,7 @@ func BenchmarkPrepare(b *testing.B) {
 }
 
 // BenchmarkPrepareCached measures repeated Prepare of the same SQL — exercises
-// the sqx-level cache concept by reusing a single statement.
+// the slite-level cache concept by reusing a single statement.
 func BenchmarkPrepareCached(b *testing.B) {
 	c := benchConn(b, 0)
 	defer c.Close()
