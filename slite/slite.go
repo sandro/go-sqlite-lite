@@ -1,4 +1,4 @@
-package sqx
+package slite
 
 import (
 	"context"
@@ -23,10 +23,6 @@ import (
 // LIMIT_VARIABLE_NUMBER so the value is always correct for the running
 // SQLite build.
 var MaxBinds = 32766
-
-// MAX_BINDS aliases MaxBinds for backwards compatibility. It is a var, not a
-// const, so it tracks the value set by NewConn.
-var MAX_BINDS = MaxBinds
 
 var defaultTimeFormats []string = []string{
 	time.RFC3339,
@@ -59,6 +55,21 @@ func supportedTimeFormats() []string {
 	return f
 }
 
+// ErrNoRows is returned by Get when the query yields no row. It mirrors
+// database/sql.ErrNoRows so callers can distinguish "no row" from other errors
+// via errors.Is(err, slite.ErrNoRows).
+var ErrNoRows = errors.New("slite: no row found")
+
+// execResult captures the LastInsertId and RowsAffected at exec time so the
+// returned sql.Result is a snapshot, not a live reference to the connection.
+type execResult struct {
+	lastInsertRowID int64
+	rowsAffected    int64
+}
+
+func (r *execResult) LastInsertId() (int64, error) { return r.lastInsertRowID, nil }
+func (r *execResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
+
 // check panics if the last argument is a non-nil error. It is intended for
 // truly fatal, should-never-happen conditions in constructors where the caller
 // has opted into panic-on-failure semantics. Data-path errors (column reads,
@@ -75,11 +86,54 @@ func check(args ...interface{}) {
 // 	return t.Format("2006-01-02T15:04:05-07:00")
 // }
 
+// Logger is the callback invoked after every SQL execution. It receives the
+// SQL text, the bind arguments, and the elapsed time. A nil logger suppresses
+// logging. Set per-connection via Conn.SetLogger or globally via
+// SetDefaultLogger.
+type Logger func(sql string, args []interface{}, elapsed time.Duration)
+
+// defaultLogger is invoked when a Conn has no logger set. nil means no logging.
+var defaultLogger Logger
+
+// SetDefaultLogger sets the package-level logger used by connections that have
+// no per-connection logger. Pass nil to suppress logging globally.
+func SetDefaultLogger(l Logger) { defaultLogger = l }
+
+// Conn is a higher-level connection that wraps a *sqlite3.Conn with a
+// statement cache, a scan-plan cache, and ergonomic query methods (Get,
+// Select, Query, Exec, InsertValues, UpdateValues). The low-level
+// *sqlite3.Conn is accessible via RawConn for advanced use cases (blobs,
+// session changesets, custom step logic) that slite does not wrap.
 type Conn struct {
-	*sqlite3.Conn
+	db         *sqlite3.Conn
 	stmtCache  map[string]*sqlite3.Stmt
 	planCache  map[string]*scanPlan // keyed by SQL string, like stmtCache
+	logger     Logger
 	closed     bool
+}
+
+// SetLogger sets the per-connection logger. Pass nil to suppress logging for
+// this connection only. If nil, the package-level default logger (set via
+// SetDefaultLogger) is used, if any.
+func (o *Conn) SetLogger(l Logger) { o.logger = l }
+
+// logSQL invokes the logger for this connection, if set. Falls back to the
+// package-level default logger. If both are nil, it is a no-op.
+func (o *Conn) logSQL(sql string, args []interface{}, elapsed time.Duration) {
+	if o.logger != nil {
+		o.logger(sql, args, elapsed)
+		return
+	}
+	if defaultLogger != nil {
+		defaultLogger(sql, args, elapsed)
+	}
+}
+
+// RawConn returns the underlying low-level *sqlite3.Conn. This is the escape
+// hatch for advanced use cases (BLOB I/O, session changesets, custom step
+// loops) that slite does not wrap. Most callers should never need this.
+func (o *Conn) RawConn() *sqlite3.Conn {
+	return o.db
 }
 
 // NewConn opens a SQLite connection at uri. If readonly is true, the connection
@@ -88,31 +142,38 @@ type Conn struct {
 func NewConn(uri string, readonly bool) (*Conn, error) {
 	c, err := sqlite3.Open(uri)
 	if err != nil {
-		return nil, fmt.Errorf("sqx: failed to open %q: %w", uri, err)
+		return nil, fmt.Errorf("slite: failed to open %q: %w", uri, err)
 	}
 	c.BusyTimeout(time.Second * 5)
 	if err := c.Exec("PRAGMA foreign_keys = ON;"); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("sqx: failed to enable foreign_keys: %w", err)
+		return nil, fmt.Errorf("slite: failed to enable foreign_keys: %w", err)
 	}
 	if readonly {
 		if err := c.Exec("PRAGMA query_only = ON;"); err != nil {
 			c.Close()
-			return nil, fmt.Errorf("sqx: failed to set query_only: %w", err)
+			return nil, fmt.Errorf("slite: failed to set query_only: %w", err)
 		}
 	}
 	// Reflect the actual bind-variable limit for this SQLite build.
 	if lim := c.Limit(sqlite3.LIMIT_VARIABLE_NUMBER, -1); lim > 0 {
 		MaxBinds = lim
-		MAX_BINDS = lim
 	}
-	conn := &Conn{Conn: c, stmtCache: make(map[string]*sqlite3.Stmt), planCache: make(map[string]*scanPlan)}
+	conn := &Conn{db: c, stmtCache: make(map[string]*sqlite3.Stmt), planCache: make(map[string]*scanPlan)}
 	return conn, nil
 }
 
 func (o *Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
-	err := o.Conn.Exec(sql, args...)
-	return o, err
+	start := time.Now()
+	err := o.db.Exec(sql, args...)
+	o.logSQL(sql, args, time.Since(start))
+	if err != nil {
+		return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
+	}
+	return &execResult{
+		lastInsertRowID: o.db.LastInsertRowID(),
+		rowsAffected:    int64(o.db.Changes()),
+	}, nil
 }
 
 func (o *Conn) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
@@ -129,13 +190,13 @@ func (o *Conn) GetVersions(query string, args ...interface{}) (versions []int64,
 
 func (o *Conn) Prepare(sql string) (*sqlite3.Stmt, error) {
 	if o.closed {
-		return nil, fmt.Errorf("sqx: Prepare on closed connection")
+		return nil, fmt.Errorf("slite: Prepare on closed connection")
 	}
 	if stmt, ok := o.stmtCache[sql]; ok && stmt != nil {
 		err := stmt.ClearBindings()
 		return stmt, err
 	}
-	stmt, err := o.Conn.Prepare(sql)
+	stmt, err := o.db.Prepare(sql)
 	if err != nil {
 		return stmt, err
 	}
@@ -155,8 +216,15 @@ func (o *Conn) Close() {
 	}
 	o.stmtCache = nil
 	o.planCache = nil
-	o.Conn.Close()
+	o.db.Close()
 }
+
+// Begin starts a transaction. Most callers should use Tx(func(c *Conn) error)
+// instead, which handles commit/rollback automatically. For manual control,
+// you can call Begin / Commit / Rollback directly.
+func (o *Conn) Begin() error    { return o.db.Begin() }
+func (o *Conn) Commit() error   { return o.db.Commit() }
+func (o *Conn) Rollback() error { return o.db.Rollback() }
 
 // cachedPlan returns the scan plan for (base, stmt), building and caching it
 // on the Conn keyed by sqlStr. This avoids re-walking the struct and the
@@ -175,44 +243,54 @@ func (o *Conn) cachedPlan(sqlStr string, base reflect.Type, stmt *sqlite3.Stmt) 
 }
 
 func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
+	start := time.Now()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		log.Println("Prepare statement failed", sql, args)
-		return err
+		o.logSQL(sql, args, time.Since(start))
+		return fmt.Errorf("slite: Prepare %q: %w", sql, err)
 	}
 	if err = stmt.Bind(args...); err != nil {
-		return err
+		o.logSQL(sql, args, time.Since(start))
+		return fmt.Errorf("slite: Bind %q: %w", sql, err)
 	}
 	defer stmt.Reset()
 	hasRow, err := stmt.Step()
 	if err != nil {
-		return err
+		o.logSQL(sql, args, time.Since(start))
+		return fmt.Errorf("slite: Step %q: %w", sql, err)
 	}
 	if !hasRow {
-		return nil
+		o.logSQL(sql, args, time.Since(start))
+		return ErrNoRows
 	}
 	v := reflect.ValueOf(dest)
 	if v.Kind() != reflect.Ptr {
-		return fmt.Errorf("sqx: dest must be a pointer, got %T", dest)
+		return fmt.Errorf("slite: dest must be a pointer, got %T", dest)
 	}
 	elem := v.Elem()
 	if elem.Kind() != reflect.Struct {
-		return fmt.Errorf("sqx: dest must point to a struct, got %s", elem.Kind())
+		return fmt.Errorf("slite: dest must point to a struct, got %s", elem.Kind())
 	}
 	plan, err := o.cachedPlan(sql, elem.Type(), stmt)
 	if err != nil {
+		o.logSQL(sql, args, time.Since(start))
 		return err
 	}
-	return applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), stmt)
+	err = applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), stmt)
+	o.logSQL(sql, args, time.Since(start))
+	return err
 }
 
 func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
+	start := time.Now()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
+		o.logSQL(sql, args, time.Since(start))
 		return err
 	}
 	defer stmt.Reset()
 	if err = stmt.Bind(args...); err != nil {
+		o.logSQL(sql, args, time.Since(start))
 		return err
 	}
 
@@ -226,39 +304,240 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 
 	hasRow, err := stmt.Step()
 	if err != nil {
+		o.logSQL(sql, args, time.Since(start))
 		return err
 	}
 	if !hasRow {
+		o.logSQL(sql, args, time.Since(start))
 		return nil
 	}
 	// Build (or fetch from Conn cache) the scan plan for this struct type +
 	// column set. The plan is reused across all rows.
 	plan, err := o.cachedPlan(sql, base, stmt)
 	if err != nil {
+		o.logSQL(sql, args, time.Since(start))
 		return err
 	}
 	for {
 		vp := reflect.New(base)
 		if err = applyPlan(plan, unsafe.Pointer(vp.Pointer()), stmt); err != nil {
+			o.logSQL(sql, args, time.Since(start))
 			return err
 		}
 		indirect.Set(reflect.Append(indirect, vp.Elem()))
 		hasRow, err = stmt.Step()
 		if err != nil {
+			o.logSQL(sql, args, time.Since(start))
 			return err
 		}
 		if !hasRow {
 			break
 		}
 	}
+	o.logSQL(sql, args, time.Since(start))
 	return nil
 }
 
-func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
+// Row provides typed column accessors for the current row of a query result.
+// Columns are accessed by name (case-insensitive) or by index. A Row is
+// reused across iterations in Query — do not retain references to it after
+// the callback returns.
+type Row struct {
+	stmt    *sqlite3.Stmt
+	colIdx  map[string]int // column name → 0-based index (case-insensitive)
+	cols    []string        // column names in order
+}
+
+// newRow builds a Row from a prepared statement. The column index map is
+// built once and reused across rows.
+func newRow(stmt *sqlite3.Stmt) *Row {
+	cols := stmt.ColumnNames()
+	idx := make(map[string]int, len(cols))
+	for i, name := range cols {
+		idx[strings.ToLower(name)] = i
+	}
+	return &Row{stmt: stmt, colIdx: idx, cols: cols}
+}
+
+// colIndex returns the 0-based column index for the given name, looking up
+// case-insensitively. Returns -1 if the column doesn't exist.
+func (r *Row) colIndex(name string) int {
+	if i, ok := r.colIdx[strings.ToLower(name)]; ok {
+		return i
+	}
+	return -1
+}
+
+// ColumnCount returns the number of columns in the result set.
+func (r *Row) ColumnCount() int { return len(r.cols) }
+
+// ColumnNames returns the names of all columns in order.
+func (r *Row) ColumnNames() []string { return r.cols }
+
+// Int returns the int64 value of the named column. The column is looked up
+// case-insensitively. Returns 0 if the column doesn't exist.
+func (r *Row) Int(col string) int64 {
+	i := r.colIndex(col)
+	if i < 0 {
+		return 0
+	}
+	v, _, err := r.stmt.ColumnInt64(i)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// Text returns the string value of the named column.
+func (r *Row) Text(col string) string {
+	i := r.colIndex(col)
+	if i < 0 {
+		return ""
+	}
+	v, _, err := r.stmt.ColumnText(i)
+	if err != nil {
+		return ""
+	}
+	return v
+}
+
+// Float returns the float64 value of the named column.
+func (r *Row) Float(col string) float64 {
+	i := r.colIndex(col)
+	if i < 0 {
+		return 0
+	}
+	v, _, err := r.stmt.ColumnDouble(i)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// Blob returns the byte slice value of the named column.
+func (r *Row) Blob(col string) []byte {
+	i := r.colIndex(col)
+	if i < 0 {
+		return nil
+	}
+	v, err := r.stmt.ColumnBlob(i)
+	if err != nil {
+		return nil
+	}
+	return v
+}
+
+// Value returns the raw value of the named column as an interface{}.
+// INTEGER → int64, FLOAT → float64, TEXT → string, BLOB → []byte, NULL → nil.
+func (r *Row) Value(col string) interface{} {
+	i := r.colIndex(col)
+	if i < 0 {
+		return nil
+	}
+	switch r.stmt.ColumnType(i) {
+	case sqlite3.SQLITE_INTEGER:
+		v, _, _ := r.stmt.ColumnInt64(i)
+		return v
+	case sqlite3.SQLITE_FLOAT:
+		v, _, _ := r.stmt.ColumnDouble(i)
+		return v
+	case sqlite3.SQLITE_TEXT:
+		v, _, _ := r.stmt.ColumnText(i)
+		return v
+	case sqlite3.SQLITE_BLOB:
+		v, _ := r.stmt.ColumnBlob(i)
+		return v
+	default:
+		return nil
+	}
+}
+
+// IsNull returns true if the named column is NULL.
+func (r *Row) IsNull(col string) bool {
+	i := r.colIndex(col)
+	if i < 0 {
+		return true
+	}
+	return r.stmt.ColumnType(i) == sqlite3.SQLITE_NULL
+}
+
+// Scan scans the current row into dest, which must be a pointer to a struct.
+// It reuses the cached scanPlan infrastructure — the same fast path as Get
+// and Select.
+func (r *Row) Scan(dest interface{}) error {
+	v := reflect.ValueOf(dest)
+	if v.Kind() != reflect.Ptr {
+		return fmt.Errorf("slite: Row.Scan dest must be a pointer, got %T", dest)
+	}
+	elem := v.Elem()
+	if elem.Kind() != reflect.Struct {
+		return fmt.Errorf("slite: Row.Scan dest must point to a struct, got %s", elem.Kind())
+	}
+	plan, err := getScanPlan(elem.Type(), r.cols)
+	if err != nil {
+		return err
+	}
+	return applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), r.stmt)
+}
+
+// Query prepares and executes sql, calling f for each result row. The *Row
+// passed to f is reused across iterations — do not retain references to it
+// after f returns. If f returns a non-nil error, iteration stops and that
+// error is returned. If the query yields no rows, f is never called and
+// nil is returned (not ErrNoRows — Query is for streaming, not single-row
+// lookups; use Get for that).
+func (o *Conn) Query(sql string, args []interface{}, f func(row *Row) error) error {
+	start := time.Now()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		log.Println("STMT ERR", err)
-		return o, err
+		o.logSQL(sql, args, time.Since(start))
+		return fmt.Errorf("slite: Prepare %q: %w", sql, err)
+	}
+	defer stmt.Reset()
+	if err = stmt.Bind(args...); err != nil {
+		o.logSQL(sql, args, time.Since(start))
+		return fmt.Errorf("slite: Bind %q: %w", sql, err)
+	}
+
+	hasRow, err := stmt.Step()
+	if err != nil {
+		o.logSQL(sql, args, time.Since(start))
+		return fmt.Errorf("slite: Step %q: %w", sql, err)
+	}
+	if !hasRow {
+		o.logSQL(sql, args, time.Since(start))
+		return nil
+	}
+
+	row := newRow(stmt)
+	for {
+		if err = f(row); err != nil {
+			o.logSQL(sql, args, time.Since(start))
+			return err
+		}
+		hasRow, err = stmt.Step()
+		if err != nil {
+			o.logSQL(sql, args, time.Since(start))
+			return fmt.Errorf("slite: Step %q: %w", sql, err)
+		}
+		if !hasRow {
+			break
+		}
+	}
+	o.logSQL(sql, args, time.Since(start))
+	return nil
+}
+
+// execCached is the internal write helper used by InsertValues and
+// UpdateValues. It prepares (via the statement cache), handles multi-statement
+// SQL (stmt.Tail), and returns a snapshot sql.Result. External callers should
+// use Exec (raw SQL) or InsertValues/UpdateValues (structured writes).
+func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
+	start := time.Now()
+	stmt, err := o.Prepare(sql)
+	if err != nil {
+		o.logSQL(sql, args, time.Since(start))
+		return nil, fmt.Errorf("slite: Prepare %q: %w", sql, err)
 	}
 	if stmt.Tail != "" {
 		// The first statement (already prepared above) is executed via stmt.Exec,
@@ -266,17 +545,21 @@ func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
 		// re-ran the *entire* sql string, double-executing the first statement
 		// and never processing the tail.
 		if err = stmt.Exec(args...); err != nil {
-			log.Println("EXEC ERR", err, sql, args)
-			return o, err
+			o.logSQL(sql, args, time.Since(start))
+			return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
 		}
-		_, err = o.Exec(stmt.Tail, args...)
-		return o, err
+		o.logSQL(sql, args, time.Since(start))
+		return o.Exec(stmt.Tail, args...)
 	}
 	if err = stmt.Exec(args...); err != nil {
-		log.Println("EXEC ERR", err, sql, args)
-		return o, err
+		o.logSQL(sql, args, time.Since(start))
+		return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
 	}
-	return o, nil
+	o.logSQL(sql, args, time.Since(start))
+	return &execResult{
+		lastInsertRowID: o.db.LastInsertRowID(),
+		rowsAffected:    int64(o.db.Changes()),
+	}, nil
 }
 
 // stmt, err := conn.Prepare(`insert or replace into vendors (id, name, indexed_at, location, created_at, updated_at)
@@ -284,10 +567,16 @@ func (o *Conn) Exec2(sql string, args ...interface{}) (sql.Result, error) {
 
 func (o *Conn) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
 	if len(attrs) == 0 {
-		return nil, fmt.Errorf("InsertValues: no attributes to insert")
+		return nil, fmt.Errorf("slite: InsertValues: no attributes to insert")
 	}
-	if len(attrs) > MAX_BINDS {
-		return nil, fmt.Errorf("cannot have more than %d bindvars", MAX_BINDS)
+	if len(attrs) > MaxBinds {
+		return nil, fmt.Errorf("slite: InsertValues: %d attributes exceeds bind limit %d", len(attrs), MaxBinds)
+	}
+	// Validate the table prefix looks like an INSERT/REPLACE statement.
+	trimmed := strings.TrimSpace(tableSQL)
+	if !strings.HasPrefix(strings.ToUpper(trimmed), "INSERT") &&
+		!strings.HasPrefix(strings.ToUpper(trimmed), "REPLACE") {
+		return nil, fmt.Errorf("slite: InsertValues: tableSQL must start with INSERT or REPLACE, got %q", tableSQL)
 	}
 	// Sort column names for deterministic SQL (stable statement caching).
 	colNames := make([]string, 0, len(attrs))
@@ -303,16 +592,21 @@ func (o *Conn) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.
 	}
 	tableSQL += " (" + strings.Join(colNames, ",") + ")"
 	tableSQL += " VALUES (" + strings.Join(binds, ",") + ")"
-	return o.Exec2(tableSQL, values...)
+	return o.execCached(tableSQL, values...)
 }
 
 // update users set x=1
 func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) (sql.Result, error) {
 	if len(attrs) == 0 {
-		return nil, fmt.Errorf("UpdateValues: no attributes to update")
+		return nil, fmt.Errorf("slite: UpdateValues: no attributes to update")
 	}
-	if len(attrs)+len(whereVals) > MAX_BINDS {
-		return nil, fmt.Errorf("cannot have more than %d bindvars", MAX_BINDS)
+	if len(attrs)+len(whereVals) > MaxBinds {
+		return nil, fmt.Errorf("slite: UpdateValues: %d bindvars exceeds limit %d", len(attrs)+len(whereVals), MaxBinds)
+	}
+	// Validate the table prefix looks like an UPDATE statement.
+	trimmed := strings.TrimSpace(tableSQL)
+	if !strings.HasPrefix(strings.ToUpper(trimmed), "UPDATE") {
+		return nil, fmt.Errorf("slite: UpdateValues: tableSQL must start with UPDATE, got %q", tableSQL)
 	}
 	// Sort column names for deterministic SQL (stable statement caching).
 	colNames := make([]string, 0, len(attrs))
@@ -334,15 +628,7 @@ func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, where
 	b.WriteString(" ")
 	b.WriteString(whereStr)
 	values = append(values, whereVals...)
-	return o.Exec2(b.String(), values...)
-}
-
-func (o *Conn) LastInsertId() (int64, error) {
-	return o.Conn.LastInsertRowID(), nil
-}
-
-func (o *Conn) RowsAffected() (int64, error) {
-	return int64(o.Conn.Changes()), nil
+	return o.execCached(b.String(), values...)
 }
 
 var timeType reflect.Type = reflect.TypeOf(time.Time{})
@@ -400,7 +686,6 @@ func parseTimeString(s string) (time.Time, bool) {
 	if err == nil {
 		return time.Unix(secs, 0), true
 	}
-	log.Println("Could not set time from", s)
 	return time.Time{}, false
 }
 
@@ -618,7 +903,7 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 		}
 	case reflect.Slice:
 		if field.Type != byteArrayType {
-			return nil, fmt.Errorf("sqx: unsupported slice type %s (only []byte)", field.Type)
+			return nil, fmt.Errorf("slite: unsupported slice type %s (only []byte)", field.Type)
 		}
 		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
 			v, err := stmt.ColumnBlob(col)
@@ -633,34 +918,34 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
 				var val interface{}
 				switch typ := stmt.ColumnType(col); typ {
-				case sqlite3.INTEGER:
+				case sqlite3.SQLITE_INTEGER:
 					v, _, err := stmt.ColumnInt64(col)
 					if err != nil {
 						return err
 					}
 					val = v
-				case sqlite3.FLOAT:
+				case sqlite3.SQLITE_FLOAT:
 					v, _, err := stmt.ColumnDouble(col)
 					if err != nil {
 						return err
 					}
 					val = v
-				case sqlite3.TEXT:
+				case sqlite3.SQLITE_TEXT:
 					v, _, err := stmt.ColumnText(col)
 					if err != nil {
 						return err
 					}
 					val = v
-				case sqlite3.NULL:
+				case sqlite3.SQLITE_NULL:
 					return nil
-				case sqlite3.BLOB:
+				case sqlite3.SQLITE_BLOB:
 					v, err := stmt.ColumnBlob(col)
 					if err != nil {
 						return err
 					}
 					val = v
 				default:
-					return fmt.Errorf("sqx: cannot set time for column type %d", typ)
+					return fmt.Errorf("slite: cannot set time for column type %d", typ)
 				}
 				tm, ok := TimeSetter(val)
 				if ok && !tm.IsZero() {
@@ -682,9 +967,9 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 					res := m.Call([]reflect.Value{reflect.ValueOf(v)})
 					if !res[0].IsNil() {
 						if uerr, ok := res[0].Interface().(error); ok {
-							return fmt.Errorf("sqx: UnmarshalText failed: %w", uerr)
+							return fmt.Errorf("slite: UnmarshalText failed: %w", uerr)
 						}
-						return fmt.Errorf("sqx: UnmarshalText failed")
+						return fmt.Errorf("slite: UnmarshalText failed")
 					}
 					// Copy the unmarshaled value into the struct via unsafe.
 					src := unsafe.Pointer(base.Pointer())
@@ -693,13 +978,13 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 					return nil
 				}
 			} else {
-				return nil, fmt.Errorf("sqx: struct field %s has no UnmarshalText and is not time.Time", field.Name)
+				return nil, fmt.Errorf("slite: struct field %s has no UnmarshalText and is not time.Time", field.Name)
 			}
 		}
 	case reflect.Ptr:
 		// nil pointer → allocate via reflect.New + convertAssign (rare path).
 		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
-			if stmt.ColumnType(col) == sqlite3.NULL {
+			if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
 				*(*unsafe.Pointer)(unsafe.Pointer(uintptr(p) + offset)) = nil
 				return nil
 			}
@@ -748,12 +1033,6 @@ func findColumn(colNames []string, consumed []bool, name string) int {
 		}
 	}
 	return -1
-}
-
-type SqlExecutor interface {
-	Exec(query string, args ...interface{}) (sql.Result, error)
-	Insert(list ...interface{}) error
-	Delete(list ...interface{}) (int64, error)
 }
 
 type DBPool struct {
@@ -873,27 +1152,13 @@ func (o *DBPool) Close() {
 	})
 }
 
-func (o *DBPool) Exec(sql string, args ...interface{}) error {
+func (o *DBPool) Exec(sql string, args ...interface{}) (sql.Result, error) {
 	db := o.CheckoutWriter()
 	if db == nil {
-		return ErrPoolClosed
+		return nil, ErrPoolClosed
 	}
 	defer o.CheckinWriter(db)
-	stmt, err := db.Prepare(sql)
-	if err != nil {
-		log.Println("STMT ERR", err)
-		return err
-	}
-	if stmt.Tail != "" {
-		err = db.Conn.Exec(sql, args...)
-	} else {
-		err = stmt.Exec(args...)
-	}
-	if err != nil {
-		log.Println("EXEC ERR", err, args)
-		return err
-	}
-	return err
+	return db.execCached(sql, args...)
 }
 
 func (o *DBPool) Select(dest interface{}, sql string, args ...interface{}) error {
@@ -914,24 +1179,31 @@ func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	return db.Get(dest, sql, args...)
 }
 
-func (o *DBPool) InsertValues(tableSQL string, attrs map[string]interface{}) error {
-	db := o.CheckoutWriter()
+func (o *DBPool) Query(sql string, args []interface{}, f func(row *Row) error) error {
+	db := o.Checkout()
 	if db == nil {
 		return ErrPoolClosed
 	}
-	defer o.CheckinWriter(db)
-	_, err := db.InsertValues(tableSQL, attrs)
-	return err
+	defer o.Checkin(db)
+	return db.Query(sql, args, f)
 }
 
-func (o *DBPool) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) error {
+func (o *DBPool) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
 	db := o.CheckoutWriter()
 	if db == nil {
-		return ErrPoolClosed
+		return nil, ErrPoolClosed
 	}
 	defer o.CheckinWriter(db)
-	_, err := db.UpdateValues(tableSQL, attrs, whereStr, whereVals...)
-	return err
+	return db.InsertValues(tableSQL, attrs)
+}
+
+func (o *DBPool) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) (sql.Result, error) {
+	db := o.CheckoutWriter()
+	if db == nil {
+		return nil, ErrPoolClosed
+	}
+	defer o.CheckinWriter(db)
+	return db.UpdateValues(tableSQL, attrs, whereStr, whereVals...)
 }
 
 func (o *DBPool) Tx(f func(c *Conn) error) (err error) {
@@ -942,7 +1214,7 @@ func (o *DBPool) Tx(f func(c *Conn) error) (err error) {
 	defer o.CheckinWriter(conn)
 
 	if err = conn.Begin(); err != nil {
-		return fmt.Errorf("sqx: failed to begin transaction: %w", err)
+		return fmt.Errorf("slite: failed to begin transaction: %w", err)
 	}
 
 	committed := false
@@ -952,7 +1224,7 @@ func (o *DBPool) Tx(f func(c *Conn) error) (err error) {
 			// convert a rollback failure into a panic that masks the original
 			// error/panic.
 			if rbErr := conn.Rollback(); rbErr != nil {
-				log.Printf("sqx: rollback after error failed: %v", rbErr)
+				log.Printf("slite: rollback after error failed: %v", rbErr)
 			}
 		}
 		if r := recover(); r != nil {
@@ -1004,29 +1276,44 @@ type BulkInserterCommand struct {
 type BulkInserter struct {
 	prefix     string
 	onConflict string
-	Size       int
+	size       int
 	count      int
 	mu         sync.Mutex
 	cmds       []BulkInserterCommand
 	conn       *Conn
 }
 
-// NewBulkInserter returns a string builder
-// prefix should be in form of "insert into table
+// NewBulkInserter creates a BulkInserter that batches INSERT statements for
+// the given *Conn. prefix should be in the form "INSERT INTO table (col1, col2)"
+// or "INSERT OR REPLACE INTO table (col1, col2)". onConflict is appended after
+// the VALUES list (e.g. "ON CONFLICT(col) DO UPDATE SET ...") or may be empty.
+// The batch size defaults to MaxBinds.
 func NewBulkInserter(prefix string, onConflict string, conn *Conn) *BulkInserter {
-	inserter := &BulkInserter{
+	return &BulkInserter{
 		prefix:     prefix,
 		onConflict: onConflict,
-		Size:       MAX_BINDS,
+		size:       MaxBinds,
 		conn:       conn,
 	}
-	return inserter
+}
+
+// NewBulkInserterPool creates a BulkInserter that uses the writer connection
+// from a DBPool. This is the recommended constructor for external callers who
+// don't have direct access to a *Conn. The writer is checked out once and held
+// for the lifetime of the inserter.
+func NewBulkInserterPool(prefix string, onConflict string, pool *DBPool) *BulkInserter {
+	return &BulkInserter{
+		prefix:     prefix,
+		onConflict: onConflict,
+		size:       MaxBinds,
+		conn:       pool.wconn,
+	}
 }
 
 var ErrArgsGreaterThanSize = errors.New("size cannot support so many args")
 
 // ErrPoolClosed is returned by DBPool methods after Close has been called.
-var ErrPoolClosed = errors.New("sqx: connection pool is closed")
+var ErrPoolClosed = errors.New("slite: connection pool is closed")
 
 func (o *BulkInserter) Add(args ...interface{}) (err error) {
 	o.mu.Lock()
@@ -1036,15 +1323,15 @@ func (o *BulkInserter) Add(args ...interface{}) (err error) {
 		return nil
 	}
 	// A single command that exceeds the bind limit can never be executed.
-	if numArgs > o.Size {
-		return fmt.Errorf("%w: command has %d args but size is %d", ErrArgsGreaterThanSize, numArgs, o.Size)
+	if numArgs > o.size {
+		return fmt.Errorf("%w: command has %d args but size is %d", ErrArgsGreaterThanSize, numArgs, o.size)
 	}
 	cmd := BulkInserterCommand{
 		Args: args,
 	}
 	// Flush when adding this command would *exceed* the limit, so a batch
 	// can actually reach the full size rather than capping at Size-1.
-	if o.count+numArgs > o.Size {
+	if o.count+numArgs > o.size {
 		err = o.commit()
 	}
 	o.cmds = append(o.cmds, cmd)
@@ -1083,7 +1370,7 @@ func (o *BulkInserter) commit() (err error) {
 	// Bypass the statement cache: the SQL varies with the number of buffered
 	// rows, so caching it would leak prepared statements unboundedly. Prepare
 	// directly on the underlying sqlite3.Conn and close the stmt after use.
-	stmt, err := o.conn.Conn.Prepare(b.String())
+	stmt, err := o.conn.db.Prepare(b.String())
 	if err != nil {
 		return err
 	}
@@ -1106,8 +1393,8 @@ func InSQL[T comparable](sql string, in []T) (string, error) {
 	if len(in) == 0 {
 		return "", fmt.Errorf("InSQL: empty input would produce invalid \"IN ()\"")
 	}
-	if len(in) > MAX_BINDS {
-		return "", fmt.Errorf("cannot have more than %d bindvars", MAX_BINDS)
+	if len(in) > MaxBinds {
+		return "", fmt.Errorf("cannot have more than %d bindvars", MaxBinds)
 	}
 	binds := make([]string, len(in))
 	for i := range in {

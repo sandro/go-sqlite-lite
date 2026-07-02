@@ -1,11 +1,11 @@
-package sqx
+package slite
 
 import (
 	"log"
 	"testing"
 )
 
-// import "github.com/sandro/go-sqlite-lite/sqx"
+// import "github.com/sandro/go-sqlite-lite/slite"
 
 var pool *DBPool
 
@@ -16,9 +16,9 @@ func init() {
 		log.Panic(err)
 	}
 	// pool = NewDBPool("test.db", 1)
-	must(pool.Exec("create table foo (name text primary key, description text)"))
-	must(pool.Exec("create table bar (name text primary key, description text, foo_id text)"))
-	must(pool.Exec("create table baz (name text primary key, description text, foo_id text)"))
+	mustRes(pool.Exec("create table foo (name text primary key, description text)"))
+	mustRes(pool.Exec("create table bar (name text primary key, description text, foo_id text)"))
+	mustRes(pool.Exec("create table baz (name text primary key, description text, foo_id text)"))
 }
 
 func must(err error) {
@@ -28,9 +28,9 @@ func must(err error) {
 }
 
 func cleanTables() {
-	pool.Exec("delete from foo")
-	pool.Exec("delete from bar")
-	pool.Exec("delete from baz")
+	_, _ = pool.Exec("delete from foo")
+	_, _ = pool.Exec("delete from bar")
+	_, _ = pool.Exec("delete from baz")
 }
 
 func testFail(t *testing.T, err error) {
@@ -57,11 +57,11 @@ func TestStructScan(t *testing.T) {
 		Bar         Bar
 		Baz         Baz
 	}
-	err := pool.Exec("insert into foo values('a1', 'aOne')")
+	_, err := pool.Exec("insert into foo values('a1', 'aOne')")
 	testFail(t, err)
-	err = pool.Exec("insert into bar values('b1', 'bOne', 'a1')")
+	_, err = pool.Exec("insert into bar values('b1', 'bOne', 'a1')")
 	testFail(t, err)
-	err = pool.Exec("insert into baz values('c1', 'cOne', 'a1')")
+	_, err = pool.Exec("insert into baz values('c1', 'cOne', 'a1')")
 	testFail(t, err)
 
 	data := Foo{}

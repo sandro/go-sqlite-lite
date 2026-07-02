@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sqx
+package slite
 
 import (
+	"database/sql"
 	"testing"
 )
 
@@ -14,24 +15,32 @@ type benchRow struct {
 	Description string `db:"description"`
 }
 
+// mustRes panics on error from a (sql.Result, error) return.
+func mustRes(_ sql.Result, err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+// benchPool creates a fresh DBPool for benchmarking.
 func benchPool(b *testing.B) *DBPool {
 	pool, err := NewDBPool("file::memory:?cache=shared", 1)
 	if err != nil {
 		b.Fatal(err)
 	}
-	must(pool.Exec("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, name TEXT, description TEXT)"))
-	must(pool.Exec("DELETE FROM bench"))
+	mustRes(pool.Exec("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, name TEXT, description TEXT)"))
+	mustRes(pool.Exec("DELETE FROM bench"))
 	return pool
 }
 
-// BenchmarkSqxSelect measures reflection-based struct scanning via sqx.Select.
-func BenchmarkSqxSelect(b *testing.B) {
+// BenchmarkSliteSelect measures reflection-based struct scanning via slite.Select.
+func BenchmarkSliteSelect(b *testing.B) {
 	pool := benchPool(b)
 	defer pool.Close()
 
 	const nrows = 1000
 	for i := 0; i < nrows; i++ {
-		must(pool.Exec("INSERT INTO bench (name, description) VALUES (?, ?)", "name", "desc"))
+		mustRes(pool.Exec("INSERT INTO bench (name, description) VALUES (?, ?)", "name", "desc"))
 	}
 
 	dest := []benchRow{}
@@ -45,12 +54,12 @@ func BenchmarkSqxSelect(b *testing.B) {
 	}
 }
 
-// BenchmarkSqxGet measures a single-row reflection scan via sqx.Get.
-func BenchmarkSqxGet(b *testing.B) {
+// BenchmarkSliteGet measures a single-row reflection scan via slite.Get.
+func BenchmarkSliteGet(b *testing.B) {
 	pool := benchPool(b)
 	defer pool.Close()
 
-	must(pool.Exec("INSERT INTO bench (name, description) VALUES (?, ?)", "name", "desc"))
+	mustRes(pool.Exec("INSERT INTO bench (name, description) VALUES (?, ?)", "name", "desc"))
 
 	var row benchRow
 	b.ReportAllocs()
@@ -71,12 +80,8 @@ func BenchmarkBulkInserter(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		must(pool.Exec("DELETE FROM bench"))
-		inserter := &BulkInserter{
-			prefix: "INSERT INTO bench (name, description)",
-			Size:   MAX_BINDS,
-			conn:   pool.wconn,
-		}
+		mustRes(pool.Exec("DELETE FROM bench"))
+		inserter := NewBulkInserterPool("INSERT INTO bench (name, description)", "", pool)
 		for j := 0; j < 500; j++ {
 			if err := inserter.Add("name", "desc"); err != nil {
 				b.Fatal(err)
@@ -97,14 +102,10 @@ func BenchmarkBulkInserterBatched(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		must(pool.Exec("DELETE FROM bench"))
-		inserter := &BulkInserter{
-			prefix: "INSERT INTO bench (name, description)",
-			Size:   MAX_BINDS,
-			conn:   pool.wconn,
-		}
-		// Fill up to the bind limit (2 args per row → Size/2 rows per batch).
-		for j := 0; j < MAX_BINDS/2; j++ {
+		mustRes(pool.Exec("DELETE FROM bench"))
+		inserter := NewBulkInserterPool("INSERT INTO bench (name, description)", "", pool)
+		// Fill up to the bind limit (2 args per row → size/2 rows per batch).
+		for j := 0; j < MaxBinds/2; j++ {
 			if err := inserter.Add("name", "desc"); err != nil {
 				b.Fatal(err)
 			}
@@ -115,7 +116,7 @@ func BenchmarkBulkInserterBatched(b *testing.B) {
 	}
 }
 
-// BenchmarkInsertValues measures the sqx.InsertValues map-based helper.
+// BenchmarkInsertValues measures the slite.InsertValues map-based helper.
 func BenchmarkInsertValues(b *testing.B) {
 	pool := benchPool(b)
 	defer pool.Close()
@@ -127,7 +128,7 @@ func BenchmarkInsertValues(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := pool.InsertValues("INSERT INTO bench", attrs); err != nil {
+		if _, err := pool.InsertValues("INSERT INTO bench", attrs); err != nil {
 			b.Fatal(err)
 		}
 	}
