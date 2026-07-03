@@ -1,252 +1,365 @@
-[![GoDoc](https://godoc.org/github.com/bvinc/go-sqlite-lite/sqlite3?status.svg)](https://godoc.org/github.com/bvinc/go-sqlite-lite/sqlite3)
-[![Build Status](https://travis-ci.com/bvinc/go-sqlite-lite.svg?branch=master)](https://travis-ci.com/bvinc/go-sqlite-lite)
-[![Build status](https://ci.appveyor.com/api/projects/status/xk6fpk23wb5ppdhx?svg=true)](https://ci.appveyor.com/project/bvinc/go-sqlite-lite)
-[![Coverage Status](https://coveralls.io/repos/github/bvinc/go-sqlite-lite/badge.svg?branch=master)](https://coveralls.io/github/bvinc/go-sqlite-lite?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/bvinc/go-sqlite-lite)](https://goreportcard.com/report/github.com/bvinc/go-sqlite-lite)
-
 # go-sqlite-lite
 
-go-sqlite-lite is a SQLite driver for the Go programming language.  It is designed with the following goals in mind.
+go-sqlite-lite is a SQLite driver for Go made of two layers:
 
-* **Lightweight** - Most methods should be little more than a small wrapper around SQLite C functions.
-* **Performance** - Where possible, methods should be available to allow for the highest performance possible.
-* **Understandable** - You should always know what SQLite functions are being called and in what order.
-* **Unsurprising** - Connections, PRAGMAs, transactions, bindings, and stepping should work out of the box exactly as you would expect with SQLite.
-* **Debuggable** - When you encounter a SQLite error, the SQLite documentation should be relevant and relatable to the Go code.
-* **Ergonomic** - Where it makes sense, convenient compound methods should exist to make tasks easy and to conform to Go standard interfaces.
+- **`sqlite3`** — a lightweight, unsurprising cgo wrapper around the SQLite C
+  API. Methods are little more than thin shims over `sqlite3_*` functions, so
+  what you read in the SQLite documentation maps directly to what you call in
+  Go. No `database/sql` layer, no connection-pool surprises, no hidden
+  behavior. When a SQLite error happens, the SQLite docs are still the right
+  docs.
+- **`slite`** — an ergonomic higher-level layer on top of `sqlite3`:
+  a connection pool with a single enforced writer, a prepared-statement cache,
+  and a struct scanner that does reflection once and then writes rows straight
+  to struct fields with unsafe pointer arithmetic.
 
-Most database drivers include a layer to work nicely with the Go `database/sql` interface, which introduces connection pooling and behavior differences from pure SQLite.  This driver does not include a `database/sql` interface.
+## Design goals
 
-## Releases
+* **Lightweight** — Where it makes sense, methods are thin wrappers around
+  SQLite C functions. The `sqlite3` package never hides what SQLite is doing.
+* **Performance** — A prepared-statement cache and a precomputed struct scan
+  plan make the common read path fast. A single enforced writer makes writes
+  safe and keeps the tail latency tight.
+* **Understandable** — You always know what SQLite functions are called and in
+  what order.
+* **Unsurprising** — Connections, PRAGMAs, transactions, bindings, and
+  stepping work exactly as you'd expect with native SQLite.
+* **Debuggable** — When you hit a SQLite error, the SQLite documentation is
+  relevant and relatable to your Go code.
+* **Ergonomic** — The `slite` package provides convenience methods
+  (`Get`, `Select`, `Tx`, `WithWriter`, `InsertValues`, `Named`) for the
+  common cases without hiding SQLite underneath.
 
-* 2019-05-01 **v0.6.1** - Bug fixes, authorizer callback support
-* 2019-05-01 **v0.6.0** - SQLite version 3.28.0
-* 2019-02-05 **v0.5.0** - SQLite version 3.26.0
-* 2018-10-30 **v0.4.2** - Better error messages from SQLite
-* 2018-10-11 **v0.4.1** - Fixed an issue with new go 1.11 modules
-* 2018-09-29 **v0.4.0** - SQLite version 3.25.2.  Add support for the Session extension
-* 2018-09-16 **v0.3.1** - Forgot to update sqlite3.h
-* 2018-09-16 **v0.3.0** - SQLite version 3.25.0
-* 2018-09-14 **v0.2.0** - Proper error and NULL handling on Column* methods.  Empty blobs and empty strings are now distinct from NULL in all cases.  A nil byte slice is interpreted as NULL for binding purposes as well as Column* methods.
-* 2018-09-01 **v0.1.2** - Added Column methods to Stmt, and WithTx methods to Conn
-* 2018-08-25 **v0.1.1** - Fixed linking on some Linux systems
-* 2018-08-21 **v0.1.0** - SQLite version 3.24.0
+Most database drivers include a layer to work with Go's `database/sql`
+interface, which introduces connection pooling and behavior differences from
+pure SQLite. This driver **does not** include a `database/sql` interface.
+For rationale, see the FAQ below.
+
+
+## Why one writer?
+
+SQLite serializes writes internally, regardless of which driver you use.
+Slite takes a stronger position: **the library enforces a single writer
+connection before SQL is ever called.** All writes go through `CheckoutWriter`
+which holds a mutex (`wmu`); reads go through a pool of N connections.
+
+This sounds like the same thing SQLite would do anyway. It is not — serializing
+in Go rather than letting SQLite resolve contention internally has structural
+advantages:
+
+**1. `SQLITE_BUSY` becomes impossible on the write path.** With one writer
+connection, the call to `sqlite3_step` is the only writer in the process. It
+never contends on SQLite's write lock, so it can never get `SQLITE_BUSY` or
+`SQLITE_LOCKED`. The entire retry/backoff/error-mapping code path that a
+multi-writer driver needs simply doesn't exist to fail. This is stability, not
+luck.
+
+**2. Tail latency is better under contention.** When a goroutine is blocked
+waiting for the writer, it parks on a Go `sync.Mutex`, which is
+scheduler-cooperative: the Go runtime parks the goroutine and frees the OS
+thread for other work (reads keep running on that thread). A driver that lets
+multiple writer connections contend inside SQLite leaves OS threads blocked
+in cgo doing busy-wait/retry inside `sqlite3_step` — the Go scheduler can
+neither reuse those threads nor see the wait. The single-writer model keeps
+threads free for reads and yields cooperative parking instead of opaque
+spinning.
+
+**3. Batching composes cleanly.** Acquire the writer once, `BEGIN`, run
+several statements, `COMMIT`. With one writer there is no interleaving and no
+two-connection transaction deadlock to reason about. This makes batching the
+natural unit of work and halves lock acquisitions when a request does several
+writes.
+
+**The honest cost** is a tiny per-write gap (one writer unlocks, the next
+locks) that a multi-connection driver could fill. The gap is paid *per write*,
+not per transaction, so batching closes it: one `Tx` per request amortizes the
+serialization gap across all the writes in that request. In a real benchmark
+of a turriate.com visit-tracking endpoint:
+
+| Mode | Driver | req/s | p99 | failures |
+|---|---:|---:|---:|---:|
+| 2 writes/request (unbatched) | mattn (multi-conn) | ~5,700 | ~48ms | yes |
+| 2 writes/request (unbatched) | slite (1 writer) | ~4,400 | ~24ms | 0 |
+| 1 tx/request (batched)       | slite (1 writer) | ~6,500 | **~9ms** | **0** |
+
+mattn squeezes higher raw throughput in the unbatched case by hot-potatoing
+SQLite's lock across connections, but pays with a 5× worse tail and intermittent
+`SQLITE_BUSY` 500s. slite parks goroutines cooperatively and, batched, beats
+mattn on *both* throughput and tail latency — with zero failures.
+
+
+## The struct scanner
+
+`slite.Get` and `slite.Select` scan rows directly into structs tagged with
+`db:"column_name"`. There is no manual `Scan(&a, &b, &c)` column list and no
+per-row reflection.
+
+```go
+type Page struct {
+    ID      string    `db:"id"`
+    Slug    string    `db:"slug"`
+    Content string    `db:"content"`
+    Updated time.Time `db:"updated_at"`
+}
+
+var page Page
+db.Get(&page, "SELECT * FROM pages WHERE slug = ?", slug)
+```
+
+How it works: reflection is used **once** per `(struct type, column set)` pair
+to build a `scanPlan` — a cached mapping from each result column to a struct
+field's offset and a setter function. The plan is stored in a `sync.Map`
+(`planCache`) keyed by struct type and the ordered column names. From then on,
+scanning a row is flat `unsafe.Pointer` writes to precomputed offsets. There is
+no reflect on the hot path.
+
+This mirrors the fast-path approach `database/sql` uses internally: reflect
+once to learn the layout, then write directly. The difference is slite builds
+the plan per (type, columns) and reuses it across every subsequent query of the
+same shape, whereas `database/sql`+`sqlx` reflect on every row.
+
+On the library-level read benchmark (`Get` against a primary-key lookup,
+seeded with 1000 rows, Apple M1 Max):
+
+| Driver | ns/op | allocs/op |
+|---|---:|---:|
+| **slite `pool.Get`** (prepared cache + scan plan) | **835** | **3** |
+| mattn `db.QueryRow().Scan` (database/sql prepare cache + sqlx) | 3,568 | 27 |
+
+slite is ~4× faster and does ~9× fewer allocations on the single-row read path.
+Both drivers cache prepared statements; the gap is slite's scan plan plus its
+leaner cgo boundary.
+
+When this matters: in query-heavy workloads (many small queries per request,
+or complex joins). When it doesn't: in workloads dominated by response
+serialization, e.g. one sub-microsecond query followed by a 55 KB HTML
+response — there the DB wrapper is ~0.07% of request time and no driver
+difference can show up in throughput. Benchmark at the layer you care about.
+
 
 ## Getting started
 
 ```go
-import "github.com/bvinc/go-sqlite-lite/sqlite3"
+import (
+    "github.com/sandro/go-sqlite-lite/slite"
+)
 ```
 
-### Acquiring a connection
+### Pool with one writer and N readers
+
 ```go
-conn, err := sqlite3.Open("mydatabase.db")
-if err != nil {
-	...
+db, err := slite.NewDBPool("file:app.db?cache=shared&mode=rwc", 10)
+if err != nil { log.Fatal(err) }
+defer db.Close()
+
+db.Exec("PRAGMA foreign_keys=ON")
+```
+
+`NewDBPool(uri, n)` creates N read connections plus one writer connection. The
+writer is reached only through `CheckoutWriter` / `Exec` / `Tx` /
+`WithWriter`. Reads use the read pool.
+
+### Executing a write
+
+`DBPool.Exec` acquires the writer, runs the statement, and releases the writer.
+Prepared statements are cached, so the second call with the same SQL reuses
+the prepared statement.
+
+```go
+_, err := db.Exec(`INSERT INTO visits (id, path) VALUES (?, ?)`, id, path)
+```
+
+### Reading into a struct
+
+```go
+var page Page
+err := db.Get(&page, "SELECT * FROM pages WHERE slug = ?", slug)
+```
+
+```go
+var pages []Page
+err := db.Select(&pages, "SELECT * FROM pages ORDER BY updated_at DESC")
+```
+
+### Iterating rows
+
+For streaming or when you don't want a slice, use `Query` with a callback. Row
+columns are typed and named.
+
+```go
+err := db.Query("SELECT id, slug FROM pages", nil, func(row *slite.Row) error {
+    id   := row.Text("id")
+    slug := row.Text("slug")
+    fmt.Println(id, slug)
+    return nil
+})
+```
+
+### Batching writes in a transaction
+
+Each `Exec` acquires the writer for one statement. When a request does several
+writes, acquire the writer once with `Tx` and run them in one transaction.
+This halves lock acquisitions and makes the writes atomic.
+
+```go
+err := db.Tx(func(c *slite.Conn) error {
+    if _, err := c.Exec(`INSERT INTO visitor_ids VALUES (0)`); err != nil {
+        return err
+    }
+    _, err := c.Exec(`INSERT INTO visits (id, path, visitor_id) VALUES (?, ?, ?)`,
+        id, path, visitorID)
+    return err
+})
+```
+
+`Tx` begins a transaction, calls your function, commits on nil error, and rolls
+back on any error or panic. The writer mutex is held for the whole call.
+
+### `WithWriter` for non-transactional multi-statement writes
+
+```go
+err := db.WithWriter(func(c *slite.Conn) error {
+    _, err := c.Exec("UPDATE counters SET n = n + 1 WHERE id = ?", id)
+    return err
+})
+```
+
+Like `Tx` but without an explicit `BEGIN`/`COMMIT` — useful for a sequence of
+autocommit writes that should share one writer checkout.
+
+### Named parameters
+
+```go
+type Person struct {
+    Name string `db:"name"`
+    Age  int    `db:"age"`
 }
+p := &Person{Name: "alice", Age: 30}
+_, err := db.NamedExec(`INSERT INTO users (name, age) VALUES (:name, :age)`, p)
+```
+
+And `IN (?)` expansion for slice binds:
+
+```go
+query, args, err := slite.In("SELECT * FROM t WHERE id IN (?) AND name = ?", ids, "foo")
+```
+
+### Nullable types
+
+`sql.Null*`, `guregu/null`, and any `driver.Valuer` bind efficiently. Embedded
+nullable types skip the reflection path and bind directly.
+
+## Advanced features
+
+* Prepared-statement cache per connection (`execCached`).
+* Named parameters (`:name`, `@name`, `$name`) and `IN (?)` slice expansion.
+* `BulkInserter` for amortized batch inserts.
+* `InsertValues` / `UpdateValues` for map-based writes.
+* SQLite Blob incremental IO API.
+* SQLite Online Backup API.
+* SQLite Session extension.
+* Custom busy handler.
+* Callback hooks on commit, rollback, and update.
+* Compile-time authorization callbacks.
+* If shared-cache mode is enabled and a statement receives `SQLITE_LOCKED`,
+  SQLite's [unlock-notify](https://sqlite.org/unlock_notify.html) extension
+  blocks transparently and retries when the conflicting statement finishes.
+* Compiled with SQLite support for JSON1, RTREE, FTS5, GEOPOLY, STAT4, and
+  SOUNDEX.
+* `OFFSET`/`LIMIT` on `UPDATE` and `DELETE`.
+* `RawString` and `RawBytes` to reduce copying between Go and SQLite (use with
+  caution).
+
+## `sqlite3` package
+
+If you want the thin layer with no pool and no struct scanner, use the
+`sqlite3` package directly. It maps closely to the SQLite C API.
+
+```go
+import "github.com/sandro/go-sqlite-lite/sqlite3"
+
+conn, err := sqlite3.Open("app.db")
+if err != nil { /* ... */ }
 defer conn.Close()
 
-// It's always a good idea to set a busy timeout
 conn.BusyTimeout(5 * time.Second)
-```
 
-### Executing SQL
-```go
 err = conn.Exec(`CREATE TABLE student(name TEXT, age INTEGER)`)
-if err != nil {
-	...
-}
-// Exec can optionally bind parameters
 err = conn.Exec(`INSERT INTO student VALUES (?, ?)`, "Bob", 18)
-if err != nil {
-	...
-}
-```
 
-### Using Prepared Statements
-```go
-stmt, err := conn.Prepare(`INSERT INTO student VALUES (?, ?)`)
-if err != nil {
-	...
-}
-defer stmt.Close()
-
-// Bind the arguments
-err = stmt.Bind("Bill", 18)
-if err != nil {
-	...
-}
-// Step the statement
-hasRow, err := stmt.Step()
-if err != nil {
-	...
-}
-// Reset the statement
-err = stmt.Reset()
-if err != nil {
-	...
-}
-```
-
-### Using Prepared Statements Conveniently
-```go
-stmt, err := conn.Prepare(`INSERT INTO student VALUES (?, ?)`)
-if err != nil {
-	...
-}
-defer stmt.Close()
-
-// Exec binds arguments, steps the statement to completion, and always resets the statement
-err = stmt.Exec("John", 19)
-if err != nil {
-	...
-}
-```
-
-### Using Queries Conveniently
-```go
-// Prepare can prepare a statement and optionally also bind arguments
 stmt, err := conn.Prepare(`SELECT name, age FROM student WHERE age = ?`, 18)
-if err != nil {
-	...
-}
 defer stmt.Close()
 
 for {
-	hasRow, err := stmt.Step()
-	if err != nil {
-		...
-	}
-	if !hasRow {
-		// The query is finished
-		break
-	}
-
-	// Use Scan to access column data from a row
-	var name string
-	var age int
-	err = stmt.Scan(&name, &age)
-	if err != nil {
-		...
-	}
-	fmt.Println("name:", name, "age:", age)
-}
-// Remember to Reset the statement if you would like to Bind new arguments and reuse the prepared statement
-```
-
-### Getting columns that might be NULL
-Scan can be convenient to use, but it doesn't handle NULL values.  To get full control of column values, there are column methods for each type.
-```go
-name, ok, err := stmt.ColumnText(0)
-if err != nil {
-	// Either the column index was out of range, or SQLite failed to allocate memory
-	...
-}
-if !ok {
-	// The column was NULL
-}
-
-age, ok, err := stmt.ColumnInt(1)
-if err != nil {
-	// Can only fail if the column index is out of range
-	...
-}
-if !ok {
-	// The column was NULL
+    hasRow, err := stmt.Step()
+    if err != nil { /* ... */ }
+    if !hasRow { break }
+    var name string
+    var age int
+    stmt.Scan(&name, &age)
 }
 ```
 
-`ColumnBlob` returns a nil slice in the case of NULL.
-```go
-blob, err := stmt.ColumnBlob(i)
-if err != nil {
-	// Either the column index was out of range, or SQLite failed to allocate memory
-	...
-}
-if blob == nil {
-	// The column was NULL
-}
-```
-
-
-
-### Using Transactions
-```go
-// Equivalent to conn.Exec("BEGIN")
-err := conn.Begin()
-if err != nil {
-	...
-}
-
-// Do some work
-...
-
-// Equivalent to conn.Exec("COMMIT")
-err = conn.Commit()
-if err != nil {
-	...
-}
-```
-
-### Using Transactions Conveniently
-
-With error handling in Go, it can be pretty inconvenient to ensure that a transaction is rolled back in the case of an error.  The `WithTx` method is provided, which accepts a function of work to do inside of a transaction.  `WithTx` will begin the transaction and call the function.  If the function returns an error, the transaction will be rolled back.  If the function succeeds, the transaction will be committed.  `WithTx` can be a little awkward to use, but it's necessary.  For example:
-
-```go
-err := conn.WithTx(func() error {
-	return insertStudents(conn)
-})
-if err != nil {
-	...
-}
-
-func insertStudents(conn *sqlite3.Conn) error {
-	...
-}
-```
-
-## Advanced Features
-* Binding parameters to statements using SQLite named parameters.
-* SQLite Blob Incremental IO API.
-* SQLite Online Backup API.
-* SQLite Session extension.
-* Supports setting a custom busy handler
-* Supports callback hooks on commit, rollback, and update.
-* Supports setting compile-Time authorization callbacks.
-* If shared cache mode is enabled and one statement receives a `SQLITE_LOCKED` error, the SQLite [unlock_notify](https://sqlite.org/unlock_notify.html) extension is used to transparently block and try again when the conflicting statement finishes.
-* Compiled with SQLite support for JSON1, RTREE, FTS5, GEOPOLY, STAT4, and SOUNDEX.
-* Compiled with SQLite support for OFFSET/LIMIT on UPDATE and DELETE statements.
-* RawString and RawBytes can be used to reduce copying between Go and SQLite.  Please use with caution.
+For full `sqlite3` semantics — bindings, transactions, NULL handling, blob
+IO — see the [GoDoc](https://godoc.org/github.com/sandro/go-sqlite-lite/sqlite3).
 
 ## Credit
-This project began as a fork of https://github.com/mxk/go-sqlite/
+
+This project began as a fork of https://github.com/mxk/go-sqlite/.
 
 ## FAQ
 
-* **Why is there no `database/sql` interface?**
+**Why is there no `database/sql` interface?**
 
-If a `database/sql` interface is required, please use https://github.com/mattn/go-sqlite3 .  In my experience, using a `database/sql` interface with SQLite is painful.  Connection pooling causes unnecessary overhead and weirdness.  Transactions using `Exec("BEGIN")` don't work as expected.  Your connection does not correspond to SQLite's concept of a connection.  PRAGMA commands do not work as expected.  When you hit SQLite errors, such as locking or busy errors, it's difficult to discover why since you don't know which connection received which SQL and in what order.
+If a `database/sql` interface is required, use
+https://github.com/mattn/go-sqlite3. In practice, using `database/sql` with
+SQLite is painful: connection pooling adds overhead and weirdness,
+`Exec("BEGIN")` transactions don't work as expected, your connection does not
+correspond to SQLite's concept of a connection, PRAGMA commands don't behave as
+expected, and when locking or busy errors occur it's difficult to discover
+why because you don't know which connection received which SQL in what order.
+slite's single-enforced-writer model deliberately removes the locking/busy
+class of errors from the write path.
 
-* **What are the differences between this driver and the mxk/go-sqlite driver?**
+**What are the differences between this driver and the `mxk/go-sqlite` driver?**
 
-This driver was forked from `mxk/go-sqlite-driver`.  It hadn't been maintained in years and used an ancient version of SQLite.  A large number of features were removed, reworked, and renamed.  A lot of smartness and state was removed.  It is now much easier to upgrade to newer versions of SQLite since the `codec` feature was removed.  The behavior of methods now lines up closely with the behavior of SQLite's C API.
+This driver was forked from `mxk/go-sqlite-driver`, which hadn't been
+maintained in years and used an ancient version of SQLite. A large number of
+features were removed, reworked, and renamed. The `codec` feature was removed,
+making it much easier to upgrade SQLite. Method behavior now lines up closely
+with the SQLite C API. On top of the `sqlite3` layer, the `slite` package adds
+a connection pool with one enforced writer, a prepared-statement cache, and a
+reflection-free struct scanner.
 
-* **What are the differences between this driver and the crawshaw/sqlite driver?**
+**What about `crawshaw/sqlite`?**
 
-The crawshaw driver is pretty well thought out and solves a lot of the same problems as this
-driver.  There are a few places where our philosophies differ.  The crawshaw driver defaults (when flags of 0 are given) to SQLite shared cache mode and WAL mode.  The default WAL synchronous mode is changed.  Prepared statements are transparently cached.  Connection pools are provided.  I would be opposed to making most of these changes to this driver.  I would like this driver to provide a default, light, and unsurprising SQLite experience.
+The crawshaw driver is well thought out and solves many of the same problems.
+There, shared-cache mode and WAL are defaults, the WAL synchronous mode is
+changed, prepared statements are transparently cached, and connection pools
+are provided. slite keeps those choices explicit (WAL is an app decision,
+shared cache is an open flag) and surfaces the single-writer invariant in the
+API rather than hiding it.
 
-* **Are finalizers provided to automatically close connections and statements?**
+**Are finalizers provided to automatically close connections and statements?**
 
-No finalizers are used in this driver.  You are responsible for closing connections and statements.  While I mostly agree with finalizers for cleaning up most accidental resource leaks, in this case, finalizers may fix errors such as locking errors while debugging only to find that the code works unreliably in production.  Removing finalizers makes the behavior consistent.
+No finalizers are used. You are responsible for closing connections and
+statements. Finalizers may mask locking errors during debugging that then
+surface unreliably in production. Removing finalizers makes behavior
+consistent.
 
-* **Is it thread safe?**
+**Is it thread safe?**
 
-go-sqlite-lite is as thread safe as SQLite.  SQLite with this driver is compiled with `-DSQLITE_THREADSAFE=2` which is **Multi-thread** mode.  In this mode, SQLite can be safely used by multiple threads provided that no single database connection is used simultaneously in two or more threads.  This applies to goroutines.  A single database connection should not be used simultaneously between two goroutines.
+go-sqlite-lite is as thread safe as SQLite. SQLite is compiled with
+`-DSQLITE_THREADSAFE=2` (Multi-thread mode): SQLite can be safely used by
+multiple threads provided that no single database connection is used
+simultaneously in two or more threads. This applies to goroutines — a single
+connection should not be used simultaneously between two goroutines.
 
-It is safe to use separate connection instances concurrently, even if they are accessing the same database file. For example:
+It is safe to use separate connection instances concurrently, even against the
+same database file:
+
 ```go
-// ERROR (without any extra synchronization)
+// ERROR (without extra synchronization)
 c, _ := sqlite3.Open("sqlite.db")
 go use(c)
 go use(c)
@@ -259,16 +372,19 @@ go use(c1)
 go use(c2)
 ```
 
-Consult the SQLite documentation for more information.
-
+Consult the SQLite documentation for more:
 https://www.sqlite.org/threadsafe.html
 
-* **How do I pool connections for handling HTTP requests?**
+slite's `DBPool` manages this for you: read connections are checked out from a
+pool (one per goroutine at a time) and the writer is behind a mutex, so the
+"one connection = one goroutine" invariant is enforced by the library.
 
-Opening new connections is cheap and connection pooling is generally unnecessary for SQLite.  I would recommend that you open a new connection for each request that you're handling.  This ensures that each request is handled separately and the normal rules of SQLite database/table locking apply.
+**How do I pool connections for HTTP requests?**
 
-If you've decided that pooling connections provides you with an advantage, it would be outside the scope of this package and something that you would need to implement and ensure works as needed.
+Use `slite.NewDBPool(uri, n)` — that's what it's for. It gives you N read
+connections plus one writer, a prepared-statement cache per connection, and
+the struct scanner. Rolling your own pool is outside the scope of this package.
 
 ## License
-This project is licensed under the BSD license.
 
+BSD licensed.
