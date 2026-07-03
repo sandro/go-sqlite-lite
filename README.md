@@ -8,10 +8,16 @@ go-sqlite-lite is a SQLite driver for Go made of two layers:
   Go. No `database/sql` layer, no connection-pool surprises, no hidden
   behavior. When a SQLite error happens, the SQLite docs are still the right
   docs.
-- **`slite`** — an ergonomic higher-level layer on top of `sqlite3`:
-  a connection pool with a single enforced writer, a prepared-statement cache,
-  and a struct scanner that does reflection once and then writes rows straight
-  to struct fields with unsafe pointer arithmetic.
+- **`slite`** — the headline layer. A connection pool with a single enforced
+  writer, a prepared-statement cache, and a struct scanner that does reflection
+  once and then writes rows straight to struct fields with unsafe pointer
+  arithmetic. `slite` is what you reach for to build a Go service on SQLite:
+  it removes the `SQLITE_BUSY` class of errors from the write path, keeps tail
+  latency tight under contention, and makes reading into structs a one-liner
+  with reflection-free hot-path scanning. The benchmarks below show ~4× faster
+  single-row reads and ~9× fewer allocations than `mattn/go-sqlite3` + `sqlx`,
+  and zero 500s under write contention where the multi-connection model
+  intermittently fails.
 
 ## Design goals
 
@@ -305,7 +311,20 @@ IO — see the [GoDoc](https://godoc.org/github.com/sandro/go-sqlite-lite/sqlite
 
 ## Credit
 
-This project began as a fork of https://github.com/mxk/go-sqlite/.
+This project is a fork of [bvinc/go-sqlite-lite](https://github.com/bvinc/go-sqlite-lite)
+(by Brian Vincent), which itself began as a fork of
+[mxk/go-sqlite](https://github.com/mxk/go-sqlite/). The `sqlite3` thin cgo
+wrapper is their work — a clean, debuggable binding to the SQLite C API that
+makes the underlying calls legible. Many thanks to **bvinc** for the original
+repository and the design ideas: the `sqlite3` layer's philosophy of "you
+always know what SQLite functions are being called and in what order" is what
+made wrapping it with `slite` worthwhile. Without that honest foundation, the
+single-writer pool and reflection-free struct scanner built on top wouldn't
+be as easy to reason about.
+
+The `slite` package — the single-writer `DBPool`, the prepared-statement
+cache, the `scanPlan` unsafe-pointer struct scanner, `Tx`/`WithWriter`,
+`Named`/`In`, and `BulkInserter` — is new on top of that fork.
 
 ## FAQ
 
