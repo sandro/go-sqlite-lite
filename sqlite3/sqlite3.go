@@ -243,12 +243,22 @@ int sqlite3_blocking_prepare_v2(
 import "C"
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"time"
 	"unsafe"
+)
+
+// Pre-computed reflect types for fast nullable-type detection in Bind.
+var (
+	nullStringType  = reflect.TypeOf(sql.NullString{})
+	nullInt64Type   = reflect.TypeOf(sql.NullInt64{})
+	nullBoolType    = reflect.TypeOf(sql.NullBool{})
+	nullFloat64Type = reflect.TypeOf(sql.NullFloat64{})
 )
 
 // initErr indicates a SQLite initialization error, which disables this package.
@@ -605,7 +615,7 @@ func (c *Conn) Backup(srcName string, dst *Conn, dstName string) (*Backup, error
 // be treated as a file for reading and/or writing. The value is located as if
 // by the following query:
 //
-// 	SELECT col FROM db.tbl WHERE rowid=row
+//	SELECT col FROM db.tbl WHERE rowid=row
 //
 // If rw is true, the value is opened with read-write access, otherwise it is
 // read-only. It is not possible to open a column that is part of an index or
@@ -874,6 +884,30 @@ func (s *Stmt) bindValue(i int, v interface{}, args []interface{}) error {
 		rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 0)
 	case ZeroBlob:
 		rc = C.sqlite3_bind_zeroblob(s.stmt, C.int(i+1), C.int(v))
+	case sql.NullString:
+		if v.Valid {
+			rc = C.bind_text(s.stmt, C.int(i+1), cStr(v.String), C.int(len(v.String)), 1)
+		} else {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		}
+	case sql.NullInt64:
+		if v.Valid {
+			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(v.Int64))
+		} else {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		}
+	case sql.NullBool:
+		if v.Valid {
+			rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(cBool(v.Bool)))
+		} else {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		}
+	case sql.NullFloat64:
+		if v.Valid {
+			rc = C.sqlite3_bind_double(s.stmt, C.int(i+1), C.double(v.Float64))
+		} else {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		}
 	case time.Time:
 		// Store instants as milliseconds since the Unix epoch. This keeps
 		// values within int64 range and round-trips cleanly for the common
@@ -888,14 +922,79 @@ func (s *Stmt) bindValue(i int, v interface{}, args []interface{}) error {
 		}
 		return s.bindNamed(v)
 	case driver.Valuer:
+		// Fast path: types that embed sql.NullString, sql.NullInt64, etc.
+		// (e.g. guregu/null.String, guregu/null.Int) embed the sql.Null*
+		// types as their first field. Use reflect to access the embedded
+		// fields directly, avoiding the Value() call which boxes into
+		// interface{} and allocates ~2 objects per call.
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Struct && rv.NumField() > 0 {
+			f0 := rv.Field(0)
+			f0t := f0.Type()
+			if f0t == nullStringType {
+				if f0.FieldByName("Valid").Bool() {
+					str := f0.FieldByName("String").String()
+					rc = C.bind_text(s.stmt, C.int(i+1), cStr(str), C.int(len(str)), 1)
+				} else {
+					rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+				}
+				break
+			}
+			if f0t == nullInt64Type {
+				if f0.FieldByName("Valid").Bool() {
+					n := f0.FieldByName("Int64").Int()
+					rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(n))
+				} else {
+					rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+				}
+				break
+			}
+			if f0t == nullBoolType {
+				if f0.FieldByName("Valid").Bool() {
+					b := f0.FieldByName("Bool").Bool()
+					rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(cBool(b)))
+				} else {
+					rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+				}
+				break
+			}
+			if f0t == nullFloat64Type {
+				if f0.FieldByName("Valid").Bool() {
+					f := f0.FieldByName("Float64").Float()
+					rc = C.sqlite3_bind_double(s.stmt, C.int(i+1), C.double(f))
+				} else {
+					rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+				}
+				break
+			}
+		}
 		val, err := v.Value()
 		if err != nil {
-			return pkgErr(MISUSE, "Valuer.Value() at index %d failed: %w", i, err)
+			return pkgErr(MISUSE, "Valuer.Value() at index %d failed: %v", i, err)
 		}
 		if val == nil {
 			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
 		} else {
-			return s.bindValue(i, val, nil)
+			switch val := val.(type) {
+			case string:
+				rc = C.bind_text(s.stmt, C.int(i+1), cStr(val), C.int(len(val)), 1)
+			case int64:
+				rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(val))
+			case int:
+				rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(val))
+			case float64:
+				rc = C.sqlite3_bind_double(s.stmt, C.int(i+1), C.double(val))
+			case bool:
+				rc = C.sqlite3_bind_int64(s.stmt, C.int(i+1), C.sqlite3_int64(cBool(val)))
+			case []byte:
+				if val == nil {
+					rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+				} else {
+					rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(val), C.int(len(val)), 1)
+				}
+			default:
+				return s.bindValue(i, val, nil)
+			}
 		}
 	default:
 		return pkgErr(MISUSE, "unsupported type at index %d (%T)", i, v)
@@ -1000,14 +1099,80 @@ func (s *Stmt) bindNamed(args NamedArgs) error {
 			rc = C.bind_blob(s.stmt, i, cBytes(v), C.int(len(v)), 0)
 		case ZeroBlob:
 			rc = C.sqlite3_bind_zeroblob(s.stmt, i, C.int(v))
+		case sql.NullString:
+			if v.Valid {
+				rc = C.bind_text(s.stmt, i, cStr(v.String), C.int(len(v.String)), 1)
+			} else {
+				rc = C.sqlite3_bind_null(s.stmt, i)
+			}
+		case sql.NullInt64:
+			if v.Valid {
+				rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(v.Int64))
+			} else {
+				rc = C.sqlite3_bind_null(s.stmt, i)
+			}
+		case sql.NullBool:
+			if v.Valid {
+				rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(cBool(v.Bool)))
+			} else {
+				rc = C.sqlite3_bind_null(s.stmt, i)
+			}
+		case sql.NullFloat64:
+			if v.Valid {
+				rc = C.sqlite3_bind_double(s.stmt, i, C.double(v.Float64))
+			} else {
+				rc = C.sqlite3_bind_null(s.stmt, i)
+			}
 		case time.Time:
 			rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(v.UnixNano()/1e6))
 		case time.Duration:
 			rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(int64(v)))
 		case driver.Valuer:
+			// Fast path for types embedding sql.Null* (see bindValue for details).
+			rv := reflect.ValueOf(v)
+			if rv.Kind() == reflect.Struct && rv.NumField() > 0 {
+				f0 := rv.Field(0)
+				f0t := f0.Type()
+				if f0t == nullStringType {
+					if f0.FieldByName("Valid").Bool() {
+						str := f0.FieldByName("String").String()
+						rc = C.bind_text(s.stmt, i, cStr(str), C.int(len(str)), 1)
+					} else {
+						rc = C.sqlite3_bind_null(s.stmt, i)
+					}
+					break
+				}
+				if f0t == nullInt64Type {
+					if f0.FieldByName("Valid").Bool() {
+						n := f0.FieldByName("Int64").Int()
+						rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(n))
+					} else {
+						rc = C.sqlite3_bind_null(s.stmt, i)
+					}
+					break
+				}
+				if f0t == nullBoolType {
+					if f0.FieldByName("Valid").Bool() {
+						b := f0.FieldByName("Bool").Bool()
+						rc = C.sqlite3_bind_int64(s.stmt, i, C.sqlite3_int64(cBool(b)))
+					} else {
+						rc = C.sqlite3_bind_null(s.stmt, i)
+					}
+					break
+				}
+				if f0t == nullFloat64Type {
+					if f0.FieldByName("Valid").Bool() {
+						f := f0.FieldByName("Float64").Float()
+						rc = C.sqlite3_bind_double(s.stmt, i, C.double(f))
+					} else {
+						rc = C.sqlite3_bind_null(s.stmt, i)
+					}
+					break
+				}
+			}
 			val, err := v.Value()
 			if err != nil {
-				return pkgErr(MISUSE, "Valuer.Value() for %s failed: %w", name, err)
+				return pkgErr(MISUSE, "Valuer.Value() for %s failed: %v", name, err)
 			}
 			if val == nil {
 				rc = C.sqlite3_bind_null(s.stmt, i)
