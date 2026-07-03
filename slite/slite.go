@@ -105,11 +105,11 @@ func SetDefaultLogger(l Logger) { defaultLogger = l }
 // *sqlite3.Conn is accessible via RawConn for advanced use cases (blobs,
 // session changesets, custom step logic) that slite does not wrap.
 type Conn struct {
-	db         *sqlite3.Conn
-	stmtCache  map[string]*sqlite3.Stmt
-	planCache  map[string]*scanPlan // keyed by SQL string, like stmtCache
-	logger     Logger
-	closed     bool
+	db        *sqlite3.Conn
+	stmtCache map[string]*sqlite3.Stmt
+	planCache map[string]*scanPlan // keyed by SQL string, like stmtCache
+	logger    Logger
+	closed    bool
 }
 
 // SetLogger sets the per-connection logger. Pass nil to suppress logging for
@@ -119,7 +119,18 @@ func (o *Conn) SetLogger(l Logger) { o.logger = l }
 
 // logSQL invokes the logger for this connection, if set. Falls back to the
 // package-level default logger. If both are nil, it is a no-op.
-func (o *Conn) logSQL(sql string, args []interface{}, elapsed time.Duration) {
+func (o *Conn) logStart() time.Time {
+	if o.logger != nil || defaultLogger != nil {
+		return time.Now()
+	}
+	return time.Time{}
+}
+
+func (o *Conn) logSQL(sql string, args []interface{}, start time.Time) {
+	if start.IsZero() {
+		return
+	}
+	elapsed := time.Since(start)
 	if o.logger != nil {
 		o.logger(sql, args, elapsed)
 		return
@@ -164,9 +175,9 @@ func NewConn(uri string, readonly bool) (*Conn, error) {
 }
 
 func (o *Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
-	start := time.Now()
+	start := o.logStart()
 	err := o.db.Exec(sql, args...)
-	o.logSQL(sql, args, time.Since(start))
+	o.logSQL(sql, args, start)
 	if err != nil {
 		return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
 	}
@@ -243,24 +254,24 @@ func (o *Conn) cachedPlan(sqlStr string, base reflect.Type, stmt *sqlite3.Stmt) 
 }
 
 func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
-	start := time.Now()
+	start := o.logStart()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return fmt.Errorf("slite: Prepare %q: %w", sql, err)
 	}
 	if err = stmt.Bind(args...); err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return fmt.Errorf("slite: Bind %q: %w", sql, err)
 	}
 	defer stmt.Reset()
 	hasRow, err := stmt.Step()
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return fmt.Errorf("slite: Step %q: %w", sql, err)
 	}
 	if !hasRow {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return ErrNoRows
 	}
 	v := reflect.ValueOf(dest)
@@ -273,24 +284,24 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 	}
 	plan, err := o.cachedPlan(sql, elem.Type(), stmt)
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return err
 	}
 	err = applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), stmt)
-	o.logSQL(sql, args, time.Since(start))
+	o.logSQL(sql, args, start)
 	return err
 }
 
 func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
-	start := time.Now()
+	start := o.logStart()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return err
 	}
 	defer stmt.Reset()
 	if err = stmt.Bind(args...); err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return err
 	}
 
@@ -304,37 +315,37 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 
 	hasRow, err := stmt.Step()
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return err
 	}
 	if !hasRow {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return nil
 	}
 	// Build (or fetch from Conn cache) the scan plan for this struct type +
 	// column set. The plan is reused across all rows.
 	plan, err := o.cachedPlan(sql, base, stmt)
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return err
 	}
 	for {
 		vp := reflect.New(base)
 		if err = applyPlan(plan, unsafe.Pointer(vp.Pointer()), stmt); err != nil {
-			o.logSQL(sql, args, time.Since(start))
+			o.logSQL(sql, args, start)
 			return err
 		}
 		indirect.Set(reflect.Append(indirect, vp.Elem()))
 		hasRow, err = stmt.Step()
 		if err != nil {
-			o.logSQL(sql, args, time.Since(start))
+			o.logSQL(sql, args, start)
 			return err
 		}
 		if !hasRow {
 			break
 		}
 	}
-	o.logSQL(sql, args, time.Since(start))
+	o.logSQL(sql, args, start)
 	return nil
 }
 
@@ -343,9 +354,9 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 // reused across iterations in Query — do not retain references to it after
 // the callback returns.
 type Row struct {
-	stmt    *sqlite3.Stmt
-	colIdx  map[string]int // column name → 0-based index (case-insensitive)
-	cols    []string        // column names in order
+	stmt   *sqlite3.Stmt
+	colIdx map[string]int // column name → 0-based index (case-insensitive)
+	cols   []string       // column names in order
 }
 
 // newRow builds a Row from a prepared statement. The column index map is
@@ -487,44 +498,44 @@ func (r *Row) Scan(dest interface{}) error {
 // nil is returned (not ErrNoRows — Query is for streaming, not single-row
 // lookups; use Get for that).
 func (o *Conn) Query(sql string, args []interface{}, f func(row *Row) error) error {
-	start := time.Now()
+	start := o.logStart()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return fmt.Errorf("slite: Prepare %q: %w", sql, err)
 	}
 	defer stmt.Reset()
 	if err = stmt.Bind(args...); err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return fmt.Errorf("slite: Bind %q: %w", sql, err)
 	}
 
 	hasRow, err := stmt.Step()
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return fmt.Errorf("slite: Step %q: %w", sql, err)
 	}
 	if !hasRow {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return nil
 	}
 
 	row := newRow(stmt)
 	for {
 		if err = f(row); err != nil {
-			o.logSQL(sql, args, time.Since(start))
+			o.logSQL(sql, args, start)
 			return err
 		}
 		hasRow, err = stmt.Step()
 		if err != nil {
-			o.logSQL(sql, args, time.Since(start))
+			o.logSQL(sql, args, start)
 			return fmt.Errorf("slite: Step %q: %w", sql, err)
 		}
 		if !hasRow {
 			break
 		}
 	}
-	o.logSQL(sql, args, time.Since(start))
+	o.logSQL(sql, args, start)
 	return nil
 }
 
@@ -533,10 +544,10 @@ func (o *Conn) Query(sql string, args []interface{}, f func(row *Row) error) err
 // SQL (stmt.Tail), and returns a snapshot sql.Result. External callers should
 // use Exec (raw SQL) or InsertValues/UpdateValues (structured writes).
 func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
-	start := time.Now()
+	start := o.logStart()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return nil, fmt.Errorf("slite: Prepare %q: %w", sql, err)
 	}
 	if stmt.Tail != "" {
@@ -545,17 +556,17 @@ func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
 		// re-ran the *entire* sql string, double-executing the first statement
 		// and never processing the tail.
 		if err = stmt.Exec(args...); err != nil {
-			o.logSQL(sql, args, time.Since(start))
+			o.logSQL(sql, args, start)
 			return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
 		}
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return o.Exec(stmt.Tail, args...)
 	}
 	if err = stmt.Exec(args...); err != nil {
-		o.logSQL(sql, args, time.Since(start))
+		o.logSQL(sql, args, start)
 		return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
 	}
-	o.logSQL(sql, args, time.Since(start))
+	o.logSQL(sql, args, start)
 	return &execResult{
 		lastInsertRowID: o.db.LastInsertRowID(),
 		rowsAffected:    int64(o.db.Changes()),
@@ -698,7 +709,6 @@ func getFieldName(fieldType reflect.StructField) string {
 	return name
 }
 
-
 // scanPlan is a cached, pre-computed mapping from query result columns to
 // struct fields. It is built once per (struct type, column set) pair via
 // reflection, then reused across rows using unsafe pointer arithmetic — no
@@ -726,8 +736,8 @@ var planCache sync.Map // map[planKey]*scanPlan
 // planKey identifies a cached scan plan by struct type and the ordered set of
 // column names returned by the query.
 type planKey struct {
-	typeID  uintptr // reflect.Type pointer identity (via reflect.Type.Pointer())
-	colKey  string  // joined column names with a separator
+	typeID uintptr // reflect.Type pointer identity (via reflect.Type.Pointer())
+	colKey string  // joined column names with a separator
 }
 
 // getScanPlan returns a cached plan for (typ, colNames), building one if needed.
@@ -1040,7 +1050,7 @@ type DBPool struct {
 	conns []*Conn
 	free  chan *Conn
 	wconn *Conn
-	wfree chan *Conn
+	wmu   sync.Mutex
 
 	closeOnce sync.Once
 	closed    bool
@@ -1090,7 +1100,8 @@ func (o *DBPool) CheckoutWriter() *Conn {
 	if o.isClosed() {
 		return nil
 	}
-	return <-o.wfree
+	o.wmu.Lock()
+	return o.wconn
 }
 
 // CheckoutWriterCtx is like CheckoutWriter but returns nil if ctx is
@@ -1099,12 +1110,8 @@ func (o *DBPool) CheckoutWriterCtx(ctx context.Context) *Conn {
 	if o.isClosed() {
 		return nil
 	}
-	select {
-	case c := <-o.wfree:
-		return c
-	case <-ctx.Done():
-		return nil
-	}
+	o.wmu.Lock()
+	return o.wconn
 }
 
 func (o *DBPool) CheckinWriter(c *Conn) {
@@ -1114,7 +1121,7 @@ func (o *DBPool) CheckinWriter(c *Conn) {
 		}
 		return
 	}
-	o.wfree <- c
+	o.wmu.Unlock()
 }
 
 func (o *DBPool) Close() {
@@ -1138,27 +1145,37 @@ func (o *DBPool) Close() {
 		for _, c := range o.conns {
 			c.Close()
 		}
-		// Close the writer connection (it should be sitting in wfree).
-		for {
-			select {
-			case c := <-o.wfree:
-				c.Close()
-			default:
-				goto doneWfree
-			}
-		}
-	doneWfree:
+		// Close the writer connection.
+		o.wmu.Lock()
 		o.wconn.Close()
+		o.wmu.Unlock()
 	})
 }
 
-func (o *DBPool) Exec(sql string, args ...interface{}) (sql.Result, error) {
+// WithWriter checks out the single writer connection for the duration of f.
+// Use this when running multiple writes that should share one writer checkout
+// but do not need a SQL transaction. For atomic multi-write operations, prefer
+// Tx, which also wraps f in BEGIN/COMMIT.
+func (o *DBPool) WithWriter(f func(c *Conn) error) error {
 	db := o.CheckoutWriter()
 	if db == nil {
-		return nil, ErrPoolClosed
+		return ErrPoolClosed
 	}
 	defer o.CheckinWriter(db)
-	return db.execCached(sql, args...)
+	return f(db)
+}
+
+// Exec runs a write statement on the single writer connection. Each Exec
+// checks out the writer, so callers doing multiple writes should use Tx or
+// WithWriter to avoid repeated writer contention.
+func (o *DBPool) Exec(query string, args ...interface{}) (sql.Result, error) {
+	var res sql.Result
+	err := o.WithWriter(func(db *Conn) error {
+		var err error
+		res, err = db.execCached(query, args...)
+		return err
+	})
+	return res, err
 }
 
 func (o *DBPool) Select(dest interface{}, sql string, args ...interface{}) error {
@@ -1262,7 +1279,6 @@ func NewDBPool(uri string, size int) (*DBPool, error) {
 	pool := &DBPool{
 		size:  size,
 		free:  make(chan *Conn, size),
-		wfree: make(chan *Conn, 1),
 		wconn: wconn,
 	}
 	for i := 0; i < size; i++ {
@@ -1274,7 +1290,6 @@ func NewDBPool(uri string, size int) (*DBPool, error) {
 		pool.conns = append(pool.conns, conn)
 		pool.Checkin(conn)
 	}
-	pool.CheckinWriter(pool.wconn)
 	return pool, nil
 }
 
