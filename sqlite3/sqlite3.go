@@ -485,7 +485,7 @@ func (c *Conn) Rollback() error {
 // and will roll back the transaction if f does return an error.
 func (c *Conn) WithTx(f func() error) error {
 	if err := c.Begin(); err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("sqlite3: failed to begin transaction: %w", err)
 	}
 
 	// Perform work inside the transaction
@@ -495,11 +495,11 @@ func (c *Conn) WithTx(f func() error) error {
 		if err2 == nil {
 			return err
 		}
-		return fmt.Errorf("%v, additionally rolling back transaction failed: %v", err, err2)
+		return fmt.Errorf("%w (additionally, rollback failed: %v)", err, err2)
 	}
 
 	if err = c.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		return fmt.Errorf("sqlite3: failed to commit transaction: %w", err)
 	}
 	return nil
 }
@@ -510,7 +510,7 @@ func (c *Conn) WithTx(f func() error) error {
 // error.
 func (c *Conn) WithTxImmediate(f func() error) error {
 	if err := c.BeginImmediate(); err != nil {
-		return fmt.Errorf("failed to begin immediate transaction: %v", err)
+		return fmt.Errorf("sqlite3: failed to begin immediate transaction: %w", err)
 	}
 
 	// Perform work inside the transaction
@@ -520,11 +520,11 @@ func (c *Conn) WithTxImmediate(f func() error) error {
 		if err2 == nil {
 			return err
 		}
-		return fmt.Errorf("%v, additionally rolling back transaction failed: %v", err, err2)
+		return fmt.Errorf("%w (additionally, rollback failed: %v)", err, err2)
 	}
 
 	if err = c.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		return fmt.Errorf("sqlite3: failed to commit transaction: %w", err)
 	}
 	return nil
 }
@@ -534,7 +534,7 @@ func (c *Conn) WithTxImmediate(f func() error) error {
 // an error, and will roll back the transaction if f does return an error.
 func (c *Conn) WithTxExclusive(f func() error) error {
 	if err := c.BeginExclusive(); err != nil {
-		return fmt.Errorf("failed to begin exclusive transaction: %v", err)
+		return fmt.Errorf("sqlite3: failed to begin exclusive transaction: %w", err)
 	}
 
 	// Perform work inside the transaction
@@ -544,11 +544,11 @@ func (c *Conn) WithTxExclusive(f func() error) error {
 		if err2 == nil {
 			return err
 		}
-		return fmt.Errorf("%v, additionally rolling back transaction failed: %v", err, err2)
+		return fmt.Errorf("%w (additionally, rollback failed: %v)", err, err2)
 	}
 
 	if err = c.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		return fmt.Errorf("sqlite3: failed to commit transaction: %w", err)
 	}
 	return nil
 }
@@ -1257,7 +1257,9 @@ func (s *Stmt) ColumnType(i int) byte {
 // https://www.sqlite.org/c3ref/column_blob.html
 func (s *Stmt) ColumnTypes() []byte {
 	s.assureColTypes()
-	return s.colTypes
+	out := make([]byte, len(s.colTypes))
+	copy(out, s.colTypes)
+	return out
 }
 
 // scan scans the value of column i (starting at 0) into v.
