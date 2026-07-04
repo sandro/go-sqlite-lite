@@ -36,10 +36,10 @@ var defaultTimeFormats []string = []string{
 	"2006-01-02 15:04:05",
 }
 
-// SupportedTimeFormats is the list of time layouts tried when parsing a TEXT
-// column into a time.Time. It is safe to replace at any time; use
-// SetSupportedTimeFormats to update it thread-safely.
-var SupportedTimeFormats []string = defaultTimeFormats
+// supportedFormats is the list of time layouts tried when parsing a TEXT
+// column into a time.Time. Use SetSupportedTimeFormats to replace it
+// thread-safely.
+var supportedFormats []string = defaultTimeFormats
 
 var timeFormatsMu sync.RWMutex
 
@@ -49,7 +49,7 @@ func SetSupportedTimeFormats(formats []string) {
 	cp := make([]string, len(formats))
 	copy(cp, formats)
 	timeFormatsMu.Lock()
-	SupportedTimeFormats = cp
+	supportedFormats = cp
 	timeFormatsMu.Unlock()
 }
 
@@ -57,7 +57,7 @@ func SetSupportedTimeFormats(formats []string) {
 // read lock.
 func supportedTimeFormats() []string {
 	timeFormatsMu.RLock()
-	f := SupportedTimeFormats
+	f := supportedFormats
 	timeFormatsMu.RUnlock()
 	return f
 }
@@ -76,22 +76,6 @@ type execResult struct {
 
 func (r *execResult) LastInsertId() (int64, error) { return r.lastInsertRowID, nil }
 func (r *execResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
-
-// check panics if the last argument is a non-nil error. It is intended for
-// truly fatal, should-never-happen conditions in constructors where the caller
-// has opted into panic-on-failure semantics. Data-path errors (column reads,
-// binding failures) must NOT route through check; they should be returned.
-func check(args ...interface{}) {
-	err, ok := args[len(args)-1].(error)
-	if ok && err != nil {
-		log.Panic(err)
-	}
-}
-
-//2006-01-02T15:04:05Z07:00
-// func DBTimeShort(t time.Time) string {
-// 	return t.Format("2006-01-02T15:04:05-07:00")
-// }
 
 // Logger is the callback invoked after every SQL execution. It receives the
 // SQL text, the bind arguments, and the elapsed time. A nil logger suppresses
@@ -194,18 +178,6 @@ func (o *Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
 		lastInsertRowID: o.db.LastInsertRowID(),
 		rowsAffected:    int64(o.db.Changes()),
 	}, nil
-}
-
-func (o *Conn) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
-	vals := []struct{ Version int64 }{}
-	err = o.Select(&vals, query, args...)
-	if err != nil {
-		return
-	}
-	for _, v := range vals {
-		versions = append(versions, v.Version)
-	}
-	return
 }
 
 func (o *Conn) Prepare(sql string) (*sqlite3.Stmt, error) {
@@ -506,7 +478,7 @@ func (r *Row) Scan(dest interface{}) error {
 // error is returned. If the query yields no rows, f is never called and
 // nil is returned (not ErrNoRows — Query is for streaming, not single-row
 // lookups; use Get for that).
-func (o *Conn) Query(sql string, args []interface{}, f func(row *Row) error) error {
+func (o *Conn) Query(sql string, f func(row *Row) error, args ...interface{}) error {
 	start := o.logStart()
 	stmt, err := o.Prepare(sql)
 	if err != nil {
@@ -654,7 +626,6 @@ func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, where
 
 var timeType reflect.Type = reflect.TypeOf(time.Time{})
 var byteArrayType reflect.Type = reflect.TypeOf([]byte{})
-var ptrByteArrayType reflect.Type = reflect.TypeOf((*[]byte)(nil))
 
 var TimeSetter = setTimeFromValue
 
@@ -1229,22 +1200,13 @@ func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
 	return db.Get(dest, sql, args...)
 }
 
-func (o *DBPool) GetVersions(query string, args ...interface{}) (versions []int64, err error) {
-	db := o.Checkout()
-	if db == nil {
-		return nil, ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.GetVersions(query, args...)
-}
-
-func (o *DBPool) Query(sql string, args []interface{}, f func(row *Row) error) error {
+func (o *DBPool) Query(sql string, f func(row *Row) error, args ...interface{}) error {
 	db := o.Checkout()
 	if db == nil {
 		return ErrPoolClosed
 	}
 	defer o.Checkin(db)
-	return db.Query(sql, args, f)
+	return db.Query(sql, f, args...)
 }
 
 func (o *DBPool) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
@@ -1326,8 +1288,8 @@ func NewDBPool(uri string, size int) (*DBPool, error) {
 	return pool, nil
 }
 
-type BulkInserterCommand struct {
-	Args []interface{}
+type bulkInserterCommand struct {
+	args []interface{}
 }
 
 type BulkInserter struct {
@@ -1336,10 +1298,8 @@ type BulkInserter struct {
 	size       int
 	count      int
 	mu         sync.Mutex
-	cmds       []BulkInserterCommand
-	// Exactly one of conn or pool is set.
-	conn *Conn   // direct connection (NewBulkInserter)
-	pool *DBPool // pool mode — writer checked out only during commit
+	cmds       []bulkInserterCommand
+	conn       *Conn
 }
 
 // NewBulkInserter creates a BulkInserter that batches INSERT statements for
@@ -1353,19 +1313,6 @@ func NewBulkInserter(prefix string, onConflict string, conn *Conn) *BulkInserter
 		onConflict: onConflict,
 		size:       maxBinds,
 		conn:       conn,
-	}
-}
-
-// NewBulkInserterPool creates a BulkInserter that uses the writer connection
-// from a DBPool. The writer is NOT checked out at creation time — it is
-// checked out only during commit/Done, so setup work does not block other
-// writers. This is the recommended constructor for callers using a pool.
-func NewBulkInserterPool(prefix string, onConflict string, pool *DBPool) *BulkInserter {
-	return &BulkInserter{
-		prefix:     prefix,
-		onConflict: onConflict,
-		size:       maxBinds,
-		pool:       pool,
 	}
 }
 
@@ -1385,8 +1332,8 @@ func (o *BulkInserter) Add(args ...interface{}) (err error) {
 	if numArgs > o.size {
 		return fmt.Errorf("%w: command has %d args but size is %d", ErrArgsGreaterThanSize, numArgs, o.size)
 	}
-	cmd := BulkInserterCommand{
-		Args: args,
+	cmd := bulkInserterCommand{
+		args: args,
 	}
 	// Flush when adding this command would *exceed* the limit, so a batch
 	// can actually reach the full size rather than capping at Size-1.
@@ -1409,8 +1356,8 @@ func (o *BulkInserter) commit() (err error) {
 	allArgs := make([]interface{}, 0, o.count)
 	for i, cmd := range o.cmds {
 		b.WriteString("(")
-		numArgs := len(cmd.Args)
-		for ii, arg := range cmd.Args {
+		numArgs := len(cmd.args)
+		for ii, arg := range cmd.args {
 			b.WriteString("?")
 			if ii < numArgs-1 {
 				b.WriteString(",")
@@ -1426,25 +1373,10 @@ func (o *BulkInserter) commit() (err error) {
 		b.WriteString(" ")
 		b.WriteString(o.onConflict)
 	}
-	sql := b.String()
-
-	// When created via NewBulkInserterPool, check out the writer for
-	// the duration of the commit only — not the whole inserter lifetime.
-	if o.pool != nil {
-		wconn := o.pool.checkoutWriter()
-		if wconn == nil {
-			return ErrPoolClosed
-		}
-		defer o.pool.checkinWriter()
-		return o.execBulk(wconn, sql, allArgs)
-	}
-	return o.execBulk(o.conn, sql, allArgs)
-}
-
-// execBulk prepares, executes, and closes a bulk INSERT statement.
-// The statement cache is bypassed because the SQL varies with row count.
-func (o *BulkInserter) execBulk(c *Conn, sql string, allArgs []interface{}) error {
-	stmt, err := c.db.Prepare(sql)
+	// Bypass the statement cache: the SQL varies with the number of buffered
+	// rows, so caching it would leak prepared statements unboundedly. Prepare
+	// directly on the underlying sqlite3.Conn and close the stmt after use.
+	stmt, err := o.conn.db.Prepare(b.String())
 	if err != nil {
 		return err
 	}
@@ -1463,18 +1395,3 @@ func (o *BulkInserter) Done() error {
 	return o.commit()
 }
 
-func InSQL[T comparable](sql string, in []T) (string, error) {
-	if len(in) == 0 {
-		return "", fmt.Errorf("InSQL: empty input would produce invalid \"IN ()\"")
-	}
-	if len(in) > maxBinds {
-		return "", fmt.Errorf("cannot have more than %d bindvars", maxBinds)
-	}
-	binds := make([]string, len(in))
-	for i := range in {
-		binds[i] = "?"
-	}
-	bindStr := strings.Join(binds, ",")
-	newSQL := fmt.Sprintf("%s in (%s)", sql, bindStr)
-	return newSQL, nil
-}

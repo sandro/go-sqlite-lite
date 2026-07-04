@@ -196,7 +196,7 @@ For streaming or when you don't want a slice, use `Query` with a callback. Row
 columns are typed and named.
 
 ```go
-err := db.Query("SELECT id, slug FROM pages", nil, func(row *slite.Row) error {
+err := db.Query("SELECT id, slug FROM pages", func(row *slite.Row) error {
     id   := row.Text("id")
     slug := row.Text("slug")
     fmt.Println(id, slug)

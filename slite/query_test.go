@@ -16,7 +16,7 @@ func TestQueryRowAccessors(t *testing.T) {
 	mustRes(conn.Exec("INSERT INTO qtest VALUES (99, 'bob', 2.71, NULL)"))
 
 	var seen int
-	err = conn.Query("SELECT id, name, score, data FROM qtest ORDER BY id", nil, func(row *Row) error {
+	err = conn.Query("SELECT id, name, score, data FROM qtest ORDER BY id", func(row *Row) error {
 		seen++
 		if row.ColumnCount() != 4 {
 			t.Errorf("row %d: ColumnCount = %d, want 4", seen, row.ColumnCount())
@@ -78,7 +78,7 @@ func TestQueryCaseInsensitive(t *testing.T) {
 	mustRes(conn.Exec("CREATE TABLE IF NOT EXISTS citest (MyColumn TEXT)"))
 	mustRes(conn.Exec("INSERT INTO citest VALUES ('hello')"))
 
-	err = conn.Query("SELECT MyColumn FROM citest", nil, func(row *Row) error {
+	err = conn.Query("SELECT MyColumn FROM citest", func(row *Row) error {
 		// Case-insensitive lookup should work
 		if row.Text("mycolumn") != "hello" {
 			t.Errorf("Text(mycolumn) = %q, want hello", row.Text("mycolumn"))
@@ -102,7 +102,7 @@ func TestQueryMissingColumn(t *testing.T) {
 	mustRes(conn.Exec("CREATE TABLE IF NOT EXISTS mtest (id INTEGER)"))
 	mustRes(conn.Exec("INSERT INTO mtest VALUES (1)"))
 
-	err = conn.Query("SELECT id FROM mtest", nil, func(row *Row) error {
+	err = conn.Query("SELECT id FROM mtest", func(row *Row) error {
 		if row.Int("nonexistent") != 0 {
 			t.Errorf("Int(nonexistent) = %d, want 0", row.Int("nonexistent"))
 		}
@@ -132,7 +132,7 @@ func TestQueryStopsOnError(t *testing.T) {
 
 	stopErr := errors.New("stop")
 	var seen int
-	err = conn.Query("SELECT id FROM etest ORDER BY id", nil, func(row *Row) error {
+	err = conn.Query("SELECT id FROM etest ORDER BY id", func(row *Row) error {
 		seen++
 		if seen == 3 {
 			return stopErr
@@ -156,7 +156,7 @@ func TestQueryNoRows(t *testing.T) {
 	mustRes(conn.Exec("CREATE TABLE IF NOT EXISTS nrtest (id INTEGER)"))
 
 	var called int
-	err = conn.Query("SELECT id FROM nrtest", nil, func(row *Row) error {
+	err = conn.Query("SELECT id FROM nrtest", func(row *Row) error {
 		called++
 		return nil
 	})
@@ -183,7 +183,7 @@ func TestQueryScan(t *testing.T) {
 		Age  int64  `db:"age"`
 	}
 	var people []Person
-	err = conn.Query("SELECT name, age FROM scantest ORDER BY age", nil, func(row *Row) error {
+	err = conn.Query("SELECT name, age FROM scantest ORDER BY age", func(row *Row) error {
 		var p Person
 		if err := row.Scan(&p); err != nil {
 			return err
@@ -215,12 +215,12 @@ func TestQueryWithArgs(t *testing.T) {
 	mustRes(conn.Exec("INSERT INTO atest VALUES (1, 'one')"))
 	mustRes(conn.Exec("INSERT INTO atest VALUES (2, 'two')"))
 
-	err = conn.Query("SELECT val FROM atest WHERE id = ?", []interface{}{2}, func(row *Row) error {
+	err = conn.Query("SELECT val FROM atest WHERE id = ?", func(row *Row) error {
 		if row.Text("val") != "two" {
 			t.Errorf("Text(val) = %q, want two", row.Text("val"))
 		}
 		return nil
-	})
+	}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

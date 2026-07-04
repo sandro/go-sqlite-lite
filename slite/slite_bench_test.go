@@ -81,13 +81,16 @@ func BenchmarkBulkInserter(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mustRes(pool.Exec("DELETE FROM bench"))
-		inserter := NewBulkInserterPool("INSERT INTO bench (name, description)", "", pool)
-		for j := 0; j < 500; j++ {
-			if err := inserter.Add("name", "desc"); err != nil {
-				b.Fatal(err)
+		err := pool.WithWriter(func(c *Conn) error {
+			inserter := NewBulkInserter("INSERT INTO bench (name, description)", "", c)
+			for j := 0; j < 500; j++ {
+				if err := inserter.Add("name", "desc"); err != nil {
+					return err
+				}
 			}
-		}
-		if err := inserter.Done(); err != nil {
+			return inserter.Done()
+		})
+		if err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -103,14 +106,17 @@ func BenchmarkBulkInserterBatched(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mustRes(pool.Exec("DELETE FROM bench"))
-		inserter := NewBulkInserterPool("INSERT INTO bench (name, description)", "", pool)
-		// Fill up to the bind limit (2 args per row → size/2 rows per batch).
-		for j := 0; j < GetMaxBinds()/2; j++ {
-			if err := inserter.Add("name", "desc"); err != nil {
-				b.Fatal(err)
+		err := pool.WithWriter(func(c *Conn) error {
+			inserter := NewBulkInserter("INSERT INTO bench (name, description)", "", c)
+			// Fill up to the bind limit (2 args per row → size/2 rows per batch).
+			for j := 0; j < GetMaxBinds()/2; j++ {
+				if err := inserter.Add("name", "desc"); err != nil {
+					return err
+				}
 			}
-		}
-		if err := inserter.Done(); err != nil {
+			return inserter.Done()
+		})
+		if err != nil {
 			b.Fatal(err)
 		}
 	}

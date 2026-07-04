@@ -105,10 +105,10 @@ func TestInDatabaseIntegration(t *testing.T) {
 	}
 
 	var names []string
-	err = conn.Query(query, args, func(row *Row) error {
+	err = conn.Query(query, func(row *Row) error {
 		names = append(names, row.Text("name"))
 		return nil
-	})
+	}, args...)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -57,7 +57,7 @@ func BenchmarkSliteQuery(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var rows []compareRow
-		err := pool.Query(selectSQL, nil, func(row *slite.Row) error {
+		err := pool.Query(selectSQL, func(row *slite.Row) error {
 			rows = append(rows, compareRow{
 				ID:          row.Int("id"),
 				Name:        row.Text("name"),

@@ -380,7 +380,7 @@ func (n *NamedStmt) Query(arg interface{}, f func(row *Row) error) error {
 	if err != nil {
 		return err
 	}
-	return n.conn.Query(n.bound, args, f)
+	return n.conn.Query(n.bound, f, args...)
 }
 
 // --- Conn named methods ---
@@ -432,7 +432,7 @@ func (o *Conn) NamedQuery(query string, arg interface{}, f func(row *Row) error)
 	if err != nil {
 		return err
 	}
-	return o.Query(bound, args, f)
+	return o.Query(bound, f, args...)
 }
 
 // --- DBPool named methods ---
