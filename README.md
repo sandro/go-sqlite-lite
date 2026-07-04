@@ -33,8 +33,8 @@ go-sqlite-lite is a SQLite driver for Go made of two layers:
 * **Debuggable** — When you hit a SQLite error, the SQLite documentation is
   relevant and relatable to your Go code.
 * **Ergonomic** — The `slite` package provides convenience methods
-  (`Get`, `Select`, `Tx`, `WithWriter`, `InsertValues`, `Named`) for the
-  common cases without hiding SQLite underneath.
+  (`Get`, `Select`, `Tx`, `WithWriter`, `InsertValues`, `Named`, `In`) for
+  the common cases without hiding SQLite underneath.
 
 Most database drivers include a layer to work with Go's `database/sql`
 interface, which introduces connection pooling and behavior differences from
@@ -46,8 +46,9 @@ For rationale, see the FAQ below.
 
 SQLite serializes writes internally, regardless of which driver you use.
 Slite takes a stronger position: **the library enforces a single writer
-connection before SQL is ever called.** All writes go through `CheckoutWriter`
-which holds a mutex (`wmu`); reads go through a pool of N connections.
+connection before SQL is ever called.** All writes go through `WithWriter`
+(or `Tx`, `Exec`, etc.) which holds a mutex (`wmu`); reads go through a pool
+of N connections.
 
 This sounds like the same thing SQLite would do anyway. It is not — serializing
 in Go rather than letting SQLite resolve contention internally has structural
@@ -158,18 +159,20 @@ db, err := slite.NewDBPool("file:app.db?cache=shared&mode=rwc", 10)
 if err != nil { log.Fatal(err) }
 defer db.Close()
 
-db.Exec("PRAGMA foreign_keys=ON")
+// Foreign keys are enabled by default. Set WAL mode for concurrent readers.
+db.Exec("PRAGMA journal_mode=WAL")
 ```
 
 `NewDBPool(uri, n)` creates N read connections plus one writer connection. The
-writer is reached only through `CheckoutWriter` / `Exec` / `Tx` /
-`WithWriter`. Reads use the read pool.
+writer is reached only through `Exec` / `Tx` / `WithWriter` /
+`WithWriterCtx`. Reads use the read pool.
 
 ### Executing a write
 
 `DBPool.Exec` acquires the writer, runs the statement, and releases the writer.
-Prepared statements are cached, so the second call with the same SQL reuses
-the prepared statement.
+Statements executed through `pool.Exec` are not cached — it is intended for
+DDL, CTEs, `INSERT…SELECT`, and other one-off SQL. For cacheable write
+patterns, use `InsertValues`, `UpdateValues`, or `Tx`.
 
 ```go
 _, err := db.Exec(`INSERT INTO visits (id, path) VALUES (?, ?)`, id, path)
@@ -282,8 +285,8 @@ The recommended style is plain `[]byte`. Prefer it in new code.
 
 ## Advanced features
 
-* Prepared-statement cache per connection (`execCached`).
-* Named parameters (`:name`, `@name`, `$name`) and `IN (?)` slice expansion.
+* Prepared-statement cache per connection.
+* Named parameters (`:name`) and `IN (?)` slice expansion.
 * `BulkInserter` for amortized batch inserts.
 * `InsertValues` / `UpdateValues` for map-based writes.
 * SQLite Blob incremental IO API.
