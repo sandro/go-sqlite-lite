@@ -11,7 +11,6 @@ import "C"
 
 import (
 	"fmt"
-	"reflect"
 	"sync"
 	"unsafe"
 )
@@ -61,8 +60,7 @@ func (s RawString) Copy() string {
 	if s == "" {
 		return ""
 	}
-	h := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	return C.GoStringN((*C.char)(unsafe.Pointer(h.Data)), C.int(h.Len))
+	return C.GoStringN((*C.char)(unsafe.Pointer(unsafe.StringData(string(s)))), C.int(len(s)))
 }
 
 // Copy returns a Go-managed copy of b.
@@ -73,8 +71,7 @@ func (b RawBytes) Copy() []byte {
 		}
 		return []byte("")
 	}
-	h := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	return C.GoBytes(unsafe.Pointer(h.Data), C.int(h.Len))
+	return C.GoBytes(unsafe.Pointer(unsafe.SliceData(b)), C.int(len(b)))
 }
 
 type Value struct {
@@ -250,14 +247,13 @@ func raw(s string) RawString {
 
 // cStr returns a pointer to the first byte in s.
 func cStr(s string) *C.char {
-	h := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	return (*C.char)(unsafe.Pointer(h.Data))
+	return (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
 }
 
 // cStrOffset returns the offset of p in s or -1 if p doesn't point into s.
 func cStrOffset(s string, p *C.char) int {
-	h := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	if off := uintptr(unsafe.Pointer(p)) - h.Data; off < uintptr(h.Len) {
+	base := uintptr(unsafe.Pointer(unsafe.StringData(s)))
+	if off := uintptr(unsafe.Pointer(p)) - base; off < uintptr(len(s)) {
 		return int(off)
 	}
 	return -1
@@ -265,7 +261,7 @@ func cStrOffset(s string, p *C.char) int {
 
 // cBytes returns a pointer to the first byte in b.
 func cBytes(b []byte) unsafe.Pointer {
-	return unsafe.Pointer((*reflect.SliceHeader)(unsafe.Pointer(&b)).Data)
+	return unsafe.Pointer(unsafe.SliceData(b))
 }
 
 // cBool returns a C representation of a Go bool (false = 0, true = 1).
@@ -277,37 +273,32 @@ func cBool(b bool) C.int {
 }
 
 // goStr returns a Go representation of a null-terminated C string.
-func goStr(p *C.char) (s string) {
-	if p != nil && *p != 0 {
-		h := (*reflect.StringHeader)(unsafe.Pointer(&s))
-		h.Data = uintptr(unsafe.Pointer(p))
-		for *p != 0 {
-			p = (*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + 1)) // p++
-		}
-		h.Len = int(uintptr(unsafe.Pointer(p)) - h.Data)
+func goStr(p *C.char) string {
+	if p == nil || *p == 0 {
+		return ""
 	}
-	return
+	start := unsafe.Pointer(p)
+	for *p != 0 {
+		p = (*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + 1)) // p++
+	}
+	n := int(uintptr(unsafe.Pointer(p)) - uintptr(start))
+	return unsafe.String((*byte)(start), n)
 }
 
 // goStrN returns a Go representation of an n-byte C string.
-func goStrN(p *C.char, n C.int) (s string) {
-	if n > 0 {
-		h := (*reflect.StringHeader)(unsafe.Pointer(&s))
-		h.Data = uintptr(unsafe.Pointer(p))
-		h.Len = int(n)
+func goStrN(p *C.char, n C.int) string {
+	if n <= 0 {
+		return ""
 	}
-	return
+	return unsafe.String((*byte)(unsafe.Pointer(p)), int(n))
 }
 
 // goBytes returns a Go representation of an n-byte C array.
-func goBytes(p unsafe.Pointer, n C.int) (b []byte) {
-	if n > 0 {
-		h := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-		h.Data = uintptr(p)
-		h.Len = int(n)
-		h.Cap = int(n)
+func goBytes(p unsafe.Pointer, n C.int) []byte {
+	if n <= 0 {
+		return nil
 	}
-	return
+	return unsafe.Slice((*byte)(p), int(n))
 }
 
 type registry struct {
