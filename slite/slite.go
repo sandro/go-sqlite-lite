@@ -555,9 +555,6 @@ func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
 	}, nil
 }
 
-// stmt, err := conn.Prepare(`insert or replace into vendors (id, name, indexed_at, location, created_at, updated_at)
-// VALUES (?, ?, ?, ?, ?, ?)`)
-
 func (o *Conn) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
 	if len(attrs) == 0 {
 		return nil, fmt.Errorf("slite: InsertValues: no attributes to insert")
@@ -588,7 +585,6 @@ func (o *Conn) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.
 	return o.execCached(tableSQL, values...)
 }
 
-// update users set x=1
 func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) (sql.Result, error) {
 	if len(attrs) == 0 {
 		return nil, fmt.Errorf("slite: UpdateValues: no attributes to update")
@@ -627,7 +623,24 @@ func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, where
 var timeType reflect.Type = reflect.TypeOf(time.Time{})
 var byteArrayType reflect.Type = reflect.TypeOf([]byte{})
 
-var TimeSetter = setTimeFromValue
+var timeSetter = setTimeFromValue
+var timeSetterMu sync.RWMutex
+
+// SetTimeSetter replaces the function used to convert database values into
+// time.Time. The default handles int64, float64, string, and []byte.
+func SetTimeSetter(f func(val any) (time.Time, bool)) {
+	timeSetterMu.Lock()
+	timeSetter = f
+	timeSetterMu.Unlock()
+}
+
+// getTimeSetter returns the current time setter under the read lock.
+func getTimeSetter() func(val any) (time.Time, bool) {
+	timeSetterMu.RLock()
+	f := timeSetter
+	timeSetterMu.RUnlock()
+	return f
+}
 
 // typedMemmove copies a value of type t from src to dst. It is equivalent to
 // *dst = *src for the concrete type t, but uses unsafe pointer copy so no
@@ -939,7 +952,7 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 				default:
 					return fmt.Errorf("slite: cannot set time for column type %d", typ)
 				}
-				tm, ok := TimeSetter(val)
+				tm, ok := getTimeSetter()(val)
 				if ok && !tm.IsZero() {
 					*(*time.Time)(unsafe.Pointer(uintptr(p) + offset)) = tm
 				}
@@ -1045,16 +1058,16 @@ func (o *DBPool) isClosed() bool {
 	return o.closed
 }
 
-func (o *DBPool) Checkout() *Conn {
+func (o *DBPool) checkout() *Conn {
 	if o.isClosed() {
 		return nil
 	}
 	return <-o.free
 }
 
-// CheckoutCtx is like Checkout but returns nil if ctx is cancelled before a
+// checkoutCtx is like checkout but returns nil if ctx is cancelled before a
 // connection becomes available.
-func (o *DBPool) CheckoutCtx(ctx context.Context) *Conn {
+func (o *DBPool) checkoutCtx(ctx context.Context) *Conn {
 	if o.isClosed() {
 		return nil
 	}
@@ -1066,13 +1079,40 @@ func (o *DBPool) CheckoutCtx(ctx context.Context) *Conn {
 	}
 }
 
-func (o *DBPool) Checkin(c *Conn) {
+func (o *DBPool) checkin(c *Conn) {
 	if o.isClosed() {
 		// Pool is closing/closed; the connection will be closed by
 		// Close() via the conns slice. Don't double-close.
 		return
 	}
 	o.free <- c
+}
+
+// WithReader checks out a read-only connection for the duration of f. The
+// connection is returned to the pool when f completes. This is the recommended
+// way to perform reads — it guarantees the connection is always returned.
+func (o *DBPool) WithReader(f func(c *Conn) error) error {
+	db := o.checkout()
+	if db == nil {
+		return ErrPoolClosed
+	}
+	defer o.checkin(db)
+	return f(db)
+}
+
+// WithReaderCtx is like WithReader but respects ctx cancellation while
+// waiting for a reader. If the context is cancelled before a reader
+// becomes available, ctx.Err() is returned.
+func (o *DBPool) WithReaderCtx(ctx context.Context, f func(c *Conn) error) error {
+	db := o.checkoutCtx(ctx)
+	if db == nil {
+		if o.isClosed() {
+			return ErrPoolClosed
+		}
+		return ctx.Err()
+	}
+	defer o.checkin(db)
+	return f(db)
 }
 
 func (o *DBPool) checkoutWriter() *Conn {
@@ -1120,7 +1160,7 @@ func (o *DBPool) Close() {
 		o.closed = true
 		o.mu.Unlock()
 
-		// Drain the channel so any concurrent Checkin calls don't block.
+		// Drain the channel so any concurrent checkin calls don't block.
 		// Then close each connection exactly once via the conns slice.
 		for {
 			select {
@@ -1183,30 +1223,21 @@ func (o *DBPool) Exec(query string, args ...interface{}) (sql.Result, error) {
 }
 
 func (o *DBPool) Select(dest interface{}, sql string, args ...interface{}) error {
-	db := o.Checkout()
-	if db == nil {
-		return ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.Select(dest, sql, args...)
+	return o.WithReader(func(db *Conn) error {
+		return db.Select(dest, sql, args...)
+	})
 }
 
 func (o *DBPool) Get(dest interface{}, sql string, args ...interface{}) error {
-	db := o.Checkout()
-	if db == nil {
-		return ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.Get(dest, sql, args...)
+	return o.WithReader(func(db *Conn) error {
+		return db.Get(dest, sql, args...)
+	})
 }
 
 func (o *DBPool) Query(sql string, f func(row *Row) error, args ...interface{}) error {
-	db := o.Checkout()
-	if db == nil {
-		return ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.Query(sql, f, args...)
+	return o.WithReader(func(db *Conn) error {
+		return db.Query(sql, f, args...)
+	})
 }
 
 func (o *DBPool) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
@@ -1283,7 +1314,7 @@ func NewDBPool(uri string, size int) (*DBPool, error) {
 			return nil, err
 		}
 		pool.conns = append(pool.conns, conn)
-		pool.Checkin(conn)
+		pool.checkin(conn)
 	}
 	return pool, nil
 }

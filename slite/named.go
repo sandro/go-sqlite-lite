@@ -311,13 +311,14 @@ func collectStructFields(v reflect.Value, prefix string, fields map[string]inter
 		}
 		fullName := prefix + name
 
-		// Recurse into nested anonymous or exported struct fields.
-		if fv.Kind() == reflect.Struct && field.Anonymous {
-			collectStructFields(fv, prefix, fields)
-			continue
-		}
-		if fv.Kind() == reflect.Struct {
-			collectStructFields(fv, fullName+".", fields)
+		// Recurse into nested struct fields, but treat time.Time as a
+		// scalar value (don't descend into its internal fields).
+		if fv.Kind() == reflect.Struct && fv.Type() != timeType {
+			if field.Anonymous {
+				collectStructFields(fv, prefix, fields)
+			} else {
+				collectStructFields(fv, fullName+".", fields)
+			}
 			continue
 		}
 
@@ -437,9 +438,12 @@ func (o *Conn) NamedQuery(query string, arg interface{}, f func(row *Row) error)
 
 // --- DBPool named methods ---
 
-// PrepareNamed compiles a named query on a writer connection and returns a
-// reusable NamedStmt bound to that connection. The NamedStmt must be used with
-// the same pool.
+// PrepareNamed compiles a named query on the writer connection and returns a
+// reusable NamedStmt bound to that connection. Because the NamedStmt holds the
+// writer conn, all operations (including reads like Get/Select/Query) run
+// through the writer, not the reader pool. For read-heavy named queries,
+// prefer calling Named() to get the bound SQL + args and passing them to the
+// pool's regular Get/Select/Query methods.
 func (o *DBPool) PrepareNamed(query string) (*NamedStmt, error) {
 	db := o.checkoutWriter()
 	if db == nil {
@@ -461,30 +465,21 @@ func (o *DBPool) NamedExec(query string, arg interface{}) (sql.Result, error) {
 
 // NamedGet executes a named query (:name) and scans a single row into dest.
 func (o *DBPool) NamedGet(dest interface{}, query string, arg interface{}) error {
-	db := o.Checkout()
-	if db == nil {
-		return ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.NamedGet(dest, query, arg)
+	return o.WithReader(func(db *Conn) error {
+		return db.NamedGet(dest, query, arg)
+	})
 }
 
 // NamedSelect executes a named query (:name) and scans all rows into dest.
 func (o *DBPool) NamedSelect(dest interface{}, query string, arg interface{}) error {
-	db := o.Checkout()
-	if db == nil {
-		return ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.NamedSelect(dest, query, arg)
+	return o.WithReader(func(db *Conn) error {
+		return db.NamedSelect(dest, query, arg)
+	})
 }
 
 // NamedQuery executes a named query (:name), calling f for each result row.
 func (o *DBPool) NamedQuery(query string, arg interface{}, f func(row *Row) error) error {
-	db := o.Checkout()
-	if db == nil {
-		return ErrPoolClosed
-	}
-	defer o.Checkin(db)
-	return db.NamedQuery(query, arg, f)
+	return o.WithReader(func(db *Conn) error {
+		return db.NamedQuery(query, arg, f)
+	})
 }

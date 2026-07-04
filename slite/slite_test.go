@@ -21,12 +21,6 @@ func init() {
 	mustRes(pool.Exec("create table baz (name text primary key, description text, foo_id text)"))
 }
 
-func must(err error) {
-	if err != nil {
-		log.Panic(err)
-	}
-}
-
 func cleanTables() {
 	_, _ = pool.Exec("delete from foo")
 	_, _ = pool.Exec("delete from bar")
