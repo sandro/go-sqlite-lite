@@ -872,11 +872,18 @@ func (s *Stmt) bindValue(i int, v interface{}, args []interface{}) error {
 	case string:
 		rc = C.bind_text(s.stmt, C.int(i+1), cStr(v), C.int(len(v)), 1)
 	case []byte:
-		// This is a strange case.  nil byte arrays should be treated as inserting NULL
+		// nil byte arrays should be treated as inserting NULL
 		if []byte(v) == nil {
 			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
 		} else {
 			rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(v), C.int(len(v)), 1)
+		}
+	case *[]byte:
+		// nil pointer or nil inner slice → NULL; otherwise bind the blob.
+		if v == nil || *v == nil {
+			rc = C.sqlite3_bind_null(s.stmt, C.int(i+1))
+		} else {
+			rc = C.bind_blob(s.stmt, C.int(i+1), cBytes(*v), C.int(len(*v)), 1)
 		}
 	case RawString:
 		rc = C.bind_text(s.stmt, C.int(i+1), cStr(string(v)), C.int(len(v)), 0)
@@ -1087,11 +1094,17 @@ func (s *Stmt) bindNamed(args NamedArgs) error {
 		case string:
 			rc = C.bind_text(s.stmt, i, cStr(v), C.int(len(v)), 1)
 		case []byte:
-			// This is a strange case.  nil byte arrays should be treated as inserting NULL
+			// nil byte arrays should be treated as inserting NULL
 			if []byte(v) == nil {
 				rc = C.sqlite3_bind_null(s.stmt, i)
 			} else {
 				rc = C.bind_blob(s.stmt, i, cBytes(v), C.int(len(v)), 1)
+			}
+		case *[]byte:
+			if v == nil || *v == nil {
+				rc = C.sqlite3_bind_null(s.stmt, i)
+			} else {
+				rc = C.bind_blob(s.stmt, i, cBytes(*v), C.int(len(*v)), 1)
 			}
 		case RawString:
 			rc = C.bind_text(s.stmt, i, cStr(string(v)), C.int(len(v)), 0)
