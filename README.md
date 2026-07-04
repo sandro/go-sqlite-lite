@@ -255,6 +255,31 @@ query, args, err := slite.In("SELECT * FROM t WHERE id IN (?) AND name = ?", ids
 `sql.Null*`, `guregu/null`, and any `driver.Valuer` bind efficiently. Embedded
 nullable types skip the reflection path and bind directly.
 
+### Blobs and `*[]byte`
+
+Use `[]byte` for blob columns. A nil `[]byte` is SQL NULL; an empty `[]byte{}`
+is an empty blob — the distinction is preserved without pointer indirection.
+
+```go
+type Row struct {
+    ID   int64  `db:"id"`
+    Data []byte `db:"data"` // nil = NULL, []byte{} = empty, []byte{...} = data
+}
+```
+
+`*[]byte` (pointer to byte slice) is also supported for both binding and
+scanning, so code migrating from `database/sql` — where `*[]byte` is the
+standard way to handle nullable blobs — works without changes. A nil pointer
+binds/scans as NULL; a non-nil pointer dereferences to the inner slice.
+
+```go
+type LegacyRow struct {
+    Data *[]byte `db:"data"` // nil pointer = NULL, &[]byte{...} = data
+}
+```
+
+The recommended style is plain `[]byte`. Prefer it in new code.
+
 ## Advanced features
 
 * Prepared-statement cache per connection (`execCached`).
