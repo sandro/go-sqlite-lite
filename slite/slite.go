@@ -78,10 +78,10 @@ func (r *execResult) LastInsertId() (int64, error) { return r.lastInsertRowID, n
 func (r *execResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
 // Logger is the callback invoked after every SQL execution. It receives the
-// SQL text, the bind arguments, and the elapsed time. A nil logger suppresses
-// logging. Set per-connection via Conn.SetLogger or globally via
-// SetDefaultLogger.
-type Logger func(sql string, args []interface{}, elapsed time.Duration)
+// SQL text, the bind arguments, the elapsed time, and the error (nil on
+// success). A nil logger suppresses logging. Set per-connection via
+// Conn.SetLogger or globally via SetDefaultLogger.
+type Logger func(sql string, args []interface{}, elapsed time.Duration, err error)
 
 // defaultLogger is invoked when a Conn has no logger set. nil means no logging.
 var defaultLogger Logger
@@ -117,17 +117,25 @@ func (o *Conn) logStart() time.Time {
 	return time.Time{}
 }
 
-func (o *Conn) logSQL(sql string, args []interface{}, start time.Time) {
+func (o *Conn) logSQL(sql string, args []interface{}, start time.Time, err error) {
 	if start.IsZero() {
 		return
 	}
 	elapsed := time.Since(start)
 	if o.logger != nil {
-		o.logger(sql, args, elapsed)
-		return
+		o.logger(sql, args, elapsed, err)
+	} else if defaultLogger != nil {
+		defaultLogger(sql, args, elapsed, err)
+	} else {
+		return // no logger, skip slow query check too
 	}
-	if defaultLogger != nil {
-		defaultLogger(sql, args, elapsed)
+
+	// Auto-EXPLAIN for slow queries.
+	if threshold := time.Duration(slowQueryThreshold.Load()); threshold > 0 && elapsed >= threshold {
+		if plan, planErr := o.ExplainPlan(sql, args...); planErr == nil && plan != "" {
+			log.Printf("slite: slow query (%s): %s\n  EXPLAIN QUERY PLAN:\n  %s",
+				elapsed, InterpolateSQL(sql, args...), strings.ReplaceAll(plan, "\n", "\n  "))
+		}
 	}
 }
 
@@ -170,9 +178,9 @@ func NewConn(uri string, readonly bool) (*Conn, error) {
 func (o *Conn) Exec(sql string, args ...interface{}) (sql.Result, error) {
 	start := o.logStart()
 	err := o.db.Exec(sql, args...)
-	o.logSQL(sql, args, start)
+	o.logSQL(sql, args, start, err)
 	if err != nil {
-		return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
+		return nil, fmt.Errorf("slite: Exec: %s: %w", InterpolateSQL(sql, args...), err)
 	}
 	return &execResult{
 		lastInsertRowID: o.db.LastInsertRowID(),
@@ -234,25 +242,25 @@ func (o *Conn) cachedPlan(sqlStr string, base reflect.Type, stmt *sqlite3.Stmt) 
 	return plan, nil
 }
 
-func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
+func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) (retErr error) {
 	start := o.logStart()
+	defer func() { o.logSQL(sql, args, start, retErr) }()
+
+	interpolated := InterpolateSQL(sql, args...)
+
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, start)
-		return fmt.Errorf("slite: Prepare %q: %w", sql, err)
+		return fmt.Errorf("slite: Prepare: %s: %w", interpolated, err)
 	}
 	if err = stmt.Bind(args...); err != nil {
-		o.logSQL(sql, args, start)
-		return fmt.Errorf("slite: Bind %q: %w", sql, err)
+		return fmt.Errorf("slite: Bind: %s: %w", interpolated, err)
 	}
 	defer stmt.Reset()
 	hasRow, err := stmt.Step()
 	if err != nil {
-		o.logSQL(sql, args, start)
-		return fmt.Errorf("slite: Step %q: %w", sql, err)
+		return fmt.Errorf("slite: Step: %s: %w", interpolated, err)
 	}
 	if !hasRow {
-		o.logSQL(sql, args, start)
 		return ErrNoRows
 	}
 	v := reflect.ValueOf(dest)
@@ -265,24 +273,21 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) error {
 	}
 	plan, err := o.cachedPlan(sql, elem.Type(), stmt)
 	if err != nil {
-		o.logSQL(sql, args, start)
 		return err
 	}
-	err = applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), stmt)
-	o.logSQL(sql, args, start)
-	return err
+	return applyPlan(plan, unsafe.Pointer(elem.UnsafeAddr()), stmt)
 }
 
-func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
+func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) (retErr error) {
 	start := o.logStart()
+	defer func() { o.logSQL(sql, args, start, retErr) }()
+
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, start)
 		return err
 	}
 	defer stmt.Reset()
 	if err = stmt.Bind(args...); err != nil {
-		o.logSQL(sql, args, start)
 		return err
 	}
 
@@ -296,37 +301,31 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) error {
 
 	hasRow, err := stmt.Step()
 	if err != nil {
-		o.logSQL(sql, args, start)
 		return err
 	}
 	if !hasRow {
-		o.logSQL(sql, args, start)
 		return nil
 	}
 	// Build (or fetch from Conn cache) the scan plan for this struct type +
 	// column set. The plan is reused across all rows.
 	plan, err := o.cachedPlan(sql, base, stmt)
 	if err != nil {
-		o.logSQL(sql, args, start)
 		return err
 	}
 	for {
 		vp := reflect.New(base)
 		if err = applyPlan(plan, unsafe.Pointer(vp.Pointer()), stmt); err != nil {
-			o.logSQL(sql, args, start)
 			return err
 		}
 		indirect.Set(reflect.Append(indirect, vp.Elem()))
 		hasRow, err = stmt.Step()
 		if err != nil {
-			o.logSQL(sql, args, start)
 			return err
 		}
 		if !hasRow {
 			break
 		}
 	}
-	o.logSQL(sql, args, start)
 	return nil
 }
 
@@ -478,45 +477,42 @@ func (r *Row) Scan(dest interface{}) error {
 // error is returned. If the query yields no rows, f is never called and
 // nil is returned (not ErrNoRows — Query is for streaming, not single-row
 // lookups; use Get for that).
-func (o *Conn) Query(sql string, f func(row *Row) error, args ...interface{}) error {
+func (o *Conn) Query(sql string, f func(row *Row) error, args ...interface{}) (retErr error) {
 	start := o.logStart()
+	defer func() { o.logSQL(sql, args, start, retErr) }()
+
+	interpolated := InterpolateSQL(sql, args...)
+
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, start)
-		return fmt.Errorf("slite: Prepare %q: %w", sql, err)
+		return fmt.Errorf("slite: Prepare: %s: %w", interpolated, err)
 	}
 	defer stmt.Reset()
 	if err = stmt.Bind(args...); err != nil {
-		o.logSQL(sql, args, start)
-		return fmt.Errorf("slite: Bind %q: %w", sql, err)
+		return fmt.Errorf("slite: Bind: %s: %w", interpolated, err)
 	}
 
 	hasRow, err := stmt.Step()
 	if err != nil {
-		o.logSQL(sql, args, start)
-		return fmt.Errorf("slite: Step %q: %w", sql, err)
+		return fmt.Errorf("slite: Step: %s: %w", interpolated, err)
 	}
 	if !hasRow {
-		o.logSQL(sql, args, start)
 		return nil
 	}
 
 	row := newRow(stmt)
 	for {
 		if err = f(row); err != nil {
-			o.logSQL(sql, args, start)
 			return err
 		}
 		hasRow, err = stmt.Step()
 		if err != nil {
-			o.logSQL(sql, args, start)
-			return fmt.Errorf("slite: Step %q: %w", sql, err)
+			return fmt.Errorf("slite: Step: %s: %w", interpolated, err)
 		}
 		if !hasRow {
 			break
 		}
 	}
-	o.logSQL(sql, args, start)
 	return nil
 }
 
@@ -524,12 +520,15 @@ func (o *Conn) Query(sql string, f func(row *Row) error, args ...interface{}) er
 // UpdateValues. It prepares (via the statement cache), handles multi-statement
 // SQL (stmt.Tail), and returns a snapshot sql.Result. External callers should
 // use Exec (raw SQL) or InsertValues/UpdateValues (structured writes).
-func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
+func (o *Conn) execCached(sql string, args ...interface{}) (_ sql.Result, retErr error) {
 	start := o.logStart()
+	defer func() { o.logSQL(sql, args, start, retErr) }()
+
+	interpolated := InterpolateSQL(sql, args...)
+
 	stmt, err := o.Prepare(sql)
 	if err != nil {
-		o.logSQL(sql, args, start)
-		return nil, fmt.Errorf("slite: Prepare %q: %w", sql, err)
+		return nil, fmt.Errorf("slite: Prepare: %s: %w", interpolated, err)
 	}
 	if stmt.Tail != "" {
 		// Multi-statement SQL: execute the first statement, then hand the
@@ -538,17 +537,13 @@ func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
 		// binds in the tail are not supported by the cache path; callers
 		// needing that should use Conn.Exec directly.
 		if err = stmt.Exec(args...); err != nil {
-			o.logSQL(sql, args, start)
-			return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
+			return nil, fmt.Errorf("slite: Exec: %s: %w", interpolated, err)
 		}
-		o.logSQL(sql, args, start)
 		return o.Exec(stmt.Tail)
 	}
 	if err = stmt.Exec(args...); err != nil {
-		o.logSQL(sql, args, start)
-		return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
+		return nil, fmt.Errorf("slite: Exec: %s: %w", interpolated, err)
 	}
-	o.logSQL(sql, args, start)
 	return &execResult{
 		lastInsertRowID: o.db.LastInsertRowID(),
 		rowsAffected:    int64(o.db.Changes()),
