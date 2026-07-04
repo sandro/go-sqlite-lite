@@ -441,21 +441,21 @@ func (o *Conn) NamedQuery(query string, arg interface{}, f func(row *Row) error)
 // reusable NamedStmt bound to that connection. The NamedStmt must be used with
 // the same pool.
 func (o *DBPool) PrepareNamed(query string) (*NamedStmt, error) {
-	db := o.CheckoutWriter()
+	db := o.checkoutWriter()
 	if db == nil {
 		return nil, ErrPoolClosed
 	}
-	defer o.CheckinWriter(db)
+	defer o.checkinWriter()
 	return db.PrepareNamed(query)
 }
 
 // NamedExec executes a named query (:name) with a struct or map argument.
 func (o *DBPool) NamedExec(query string, arg interface{}) (sql.Result, error) {
-	db := o.CheckoutWriter()
+	db := o.checkoutWriter()
 	if db == nil {
 		return nil, ErrPoolClosed
 	}
-	defer o.CheckinWriter(db)
+	defer o.checkinWriter()
 	return db.NamedExec(query, arg)
 }
 

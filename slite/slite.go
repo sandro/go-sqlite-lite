@@ -17,12 +17,19 @@ import (
 	"github.com/sandro/go-sqlite-lite/sqlite3"
 )
 
-// MaxBinds is the maximum number of bind variables allowed in a single
+// maxBinds is the maximum number of bind variables allowed in a single
 // statement. It defaults to SQLite's modern default (32766, since SQLite
 // 3.32); NewConn updates it from the connection's actual
 // LIMIT_VARIABLE_NUMBER so the value is always correct for the running
 // SQLite build.
-var MaxBinds = 32766
+var (
+	maxBinds     = 32766
+	maxBindsOnce sync.Once
+)
+
+// GetMaxBinds returns the maximum number of bind variables allowed in a
+// single statement for the current SQLite build.
+func GetMaxBinds() int { return maxBinds }
 
 var defaultTimeFormats []string = []string{
 	time.RFC3339,
@@ -167,9 +174,11 @@ func NewConn(uri string, readonly bool) (*Conn, error) {
 		}
 	}
 	// Reflect the actual bind-variable limit for this SQLite build.
-	if lim := c.Limit(sqlite3.LIMIT_VARIABLE_NUMBER, -1); lim > 0 {
-		MaxBinds = lim
-	}
+	maxBindsOnce.Do(func() {
+		if lim := c.Limit(sqlite3.LIMIT_VARIABLE_NUMBER, -1); lim > 0 {
+			maxBinds = lim
+		}
+	})
 	conn := &Conn{db: c, stmtCache: make(map[string]*sqlite3.Stmt), planCache: make(map[string]*scanPlan)}
 	return conn, nil
 }
@@ -551,16 +560,17 @@ func (o *Conn) execCached(sql string, args ...interface{}) (sql.Result, error) {
 		return nil, fmt.Errorf("slite: Prepare %q: %w", sql, err)
 	}
 	if stmt.Tail != "" {
-		// The first statement (already prepared above) is executed via stmt.Exec,
-		// then the leftover text is executed separately. Previously this
-		// re-ran the *entire* sql string, double-executing the first statement
-		// and never processing the tail.
+		// Multi-statement SQL: execute the first statement, then hand the
+		// tail to Exec (which uses the raw sqlite3 exec path, not the cache).
+		// The tail runs with no bind args — multi-statement strings with
+		// binds in the tail are not supported by the cache path; callers
+		// needing that should use Conn.Exec directly.
 		if err = stmt.Exec(args...); err != nil {
 			o.logSQL(sql, args, start)
 			return nil, fmt.Errorf("slite: Exec %q: %w", sql, err)
 		}
 		o.logSQL(sql, args, start)
-		return o.Exec(stmt.Tail, args...)
+		return o.Exec(stmt.Tail)
 	}
 	if err = stmt.Exec(args...); err != nil {
 		o.logSQL(sql, args, start)
@@ -580,8 +590,8 @@ func (o *Conn) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.
 	if len(attrs) == 0 {
 		return nil, fmt.Errorf("slite: InsertValues: no attributes to insert")
 	}
-	if len(attrs) > MaxBinds {
-		return nil, fmt.Errorf("slite: InsertValues: %d attributes exceeds bind limit %d", len(attrs), MaxBinds)
+	if len(attrs) > maxBinds {
+		return nil, fmt.Errorf("slite: InsertValues: %d attributes exceeds bind limit %d", len(attrs), maxBinds)
 	}
 	// Validate the table prefix looks like an INSERT/REPLACE statement.
 	trimmed := strings.TrimSpace(tableSQL)
@@ -611,8 +621,8 @@ func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, where
 	if len(attrs) == 0 {
 		return nil, fmt.Errorf("slite: UpdateValues: no attributes to update")
 	}
-	if len(attrs)+len(whereVals) > MaxBinds {
-		return nil, fmt.Errorf("slite: UpdateValues: %d bindvars exceeds limit %d", len(attrs)+len(whereVals), MaxBinds)
+	if len(attrs)+len(whereVals) > maxBinds {
+		return nil, fmt.Errorf("slite: UpdateValues: %d bindvars exceeds limit %d", len(attrs)+len(whereVals), maxBinds)
 	}
 	// Validate the table prefix looks like an UPDATE statement.
 	trimmed := strings.TrimSpace(tableSQL)
@@ -644,6 +654,7 @@ func (o *Conn) UpdateValues(tableSQL string, attrs map[string]interface{}, where
 
 var timeType reflect.Type = reflect.TypeOf(time.Time{})
 var byteArrayType reflect.Type = reflect.TypeOf([]byte{})
+var ptrByteArrayType reflect.Type = reflect.TypeOf((*[]byte)(nil))
 
 var TimeSetter = setTimeFromValue
 
@@ -1086,17 +1097,14 @@ func (o *DBPool) CheckoutCtx(ctx context.Context) *Conn {
 
 func (o *DBPool) Checkin(c *Conn) {
 	if o.isClosed() {
-		// Pool is closing/closed; close the connection directly instead of
-		// returning it to a channel that may already be drained.
-		if c != nil {
-			c.Close()
-		}
+		// Pool is closing/closed; the connection will be closed by
+		// Close() via the conns slice. Don't double-close.
 		return
 	}
 	o.free <- c
 }
 
-func (o *DBPool) CheckoutWriter() *Conn {
+func (o *DBPool) checkoutWriter() *Conn {
 	if o.isClosed() {
 		return nil
 	}
@@ -1104,23 +1112,34 @@ func (o *DBPool) CheckoutWriter() *Conn {
 	return o.wconn
 }
 
-// CheckoutWriterCtx is like CheckoutWriter but returns nil if ctx is
+// checkoutWriterCtx is like checkoutWriter but returns nil if ctx is
 // cancelled before the writer becomes available.
-func (o *DBPool) CheckoutWriterCtx(ctx context.Context) *Conn {
+func (o *DBPool) checkoutWriterCtx(ctx context.Context) *Conn {
 	if o.isClosed() {
 		return nil
 	}
-	o.wmu.Lock()
-	return o.wconn
+	// Try to acquire the writer mutex in a context-aware way.
+	// We spin up a goroutine to do the blocking Lock and signal via channel.
+	ch := make(chan struct{})
+	go func() {
+		o.wmu.Lock()
+		close(ch)
+	}()
+	select {
+	case <-ch:
+		return o.wconn
+	case <-ctx.Done():
+		// Context cancelled. The goroutine will eventually acquire the lock;
+		// we must unlock it when it does so the mutex isn't left held.
+		go func() {
+			<-ch
+			o.wmu.Unlock()
+		}()
+		return nil
+	}
 }
 
-func (o *DBPool) CheckinWriter(c *Conn) {
-	if o.isClosed() {
-		if c != nil {
-			c.Close()
-		}
-		return
-	}
+func (o *DBPool) checkinWriter() {
 	o.wmu.Unlock()
 }
 
@@ -1130,13 +1149,11 @@ func (o *DBPool) Close() {
 		o.closed = true
 		o.mu.Unlock()
 
-		// Close all pooled connections. Drain the channels first so that any
-		// connections checked in concurrently are closed here rather than
-		// being sent to a (potentially drained) channel.
+		// Drain the channel so any concurrent Checkin calls don't block.
+		// Then close each connection exactly once via the conns slice.
 		for {
 			select {
-			case c := <-o.free:
-				c.Close()
+			case <-o.free:
 			default:
 				goto doneFree
 			}
@@ -1157,22 +1174,38 @@ func (o *DBPool) Close() {
 // but do not need a SQL transaction. For atomic multi-write operations, prefer
 // Tx, which also wraps f in BEGIN/COMMIT.
 func (o *DBPool) WithWriter(f func(c *Conn) error) error {
-	db := o.CheckoutWriter()
+	db := o.checkoutWriter()
 	if db == nil {
 		return ErrPoolClosed
 	}
-	defer o.CheckinWriter(db)
+	defer o.checkinWriter()
 	return f(db)
 }
 
-// Exec runs a write statement on the single writer connection. Each Exec
-// checks out the writer, so callers doing multiple writes should use Tx or
-// WithWriter to avoid repeated writer contention.
+// WithWriterCtx is like WithWriter but respects ctx cancellation while
+// waiting for the writer. If the context is cancelled before the writer
+// becomes available, ctx.Err() is returned (no write is attempted).
+func (o *DBPool) WithWriterCtx(ctx context.Context, f func(c *Conn) error) error {
+	db := o.checkoutWriterCtx(ctx)
+	if db == nil {
+		if o.isClosed() {
+			return ErrPoolClosed
+		}
+		return ctx.Err()
+	}
+	defer o.checkinWriter()
+	return f(db)
+}
+
+// Exec runs a write statement on the single writer connection. The statement
+// is NOT cached: pool.Exec is typically used for DDL, CTEs, INSERT…SELECT,
+// and other one-off SQL where caching the prepared statement provides no
+// benefit. Use InsertValues/UpdateValues/Tx for cacheable write patterns.
 func (o *DBPool) Exec(query string, args ...interface{}) (sql.Result, error) {
 	var res sql.Result
 	err := o.WithWriter(func(db *Conn) error {
 		var err error
-		res, err = db.execCached(query, args...)
+		res, err = db.Exec(query, args...)
 		return err
 	})
 	return res, err
@@ -1215,29 +1248,29 @@ func (o *DBPool) Query(sql string, args []interface{}, f func(row *Row) error) e
 }
 
 func (o *DBPool) InsertValues(tableSQL string, attrs map[string]interface{}) (sql.Result, error) {
-	db := o.CheckoutWriter()
+	db := o.checkoutWriter()
 	if db == nil {
 		return nil, ErrPoolClosed
 	}
-	defer o.CheckinWriter(db)
+	defer o.checkinWriter()
 	return db.InsertValues(tableSQL, attrs)
 }
 
 func (o *DBPool) UpdateValues(tableSQL string, attrs map[string]interface{}, whereStr string, whereVals ...interface{}) (sql.Result, error) {
-	db := o.CheckoutWriter()
+	db := o.checkoutWriter()
 	if db == nil {
 		return nil, ErrPoolClosed
 	}
-	defer o.CheckinWriter(db)
+	defer o.checkinWriter()
 	return db.UpdateValues(tableSQL, attrs, whereStr, whereVals...)
 }
 
 func (o *DBPool) Tx(f func(c *Conn) error) (err error) {
-	conn := o.CheckoutWriter()
+	conn := o.checkoutWriter()
 	if conn == nil {
 		return ErrPoolClosed
 	}
-	defer o.CheckinWriter(conn)
+	defer o.checkinWriter()
 
 	if err = conn.Begin(); err != nil {
 		return fmt.Errorf("slite: failed to begin transaction: %w", err)
@@ -1304,33 +1337,35 @@ type BulkInserter struct {
 	count      int
 	mu         sync.Mutex
 	cmds       []BulkInserterCommand
-	conn       *Conn
+	// Exactly one of conn or pool is set.
+	conn *Conn   // direct connection (NewBulkInserter)
+	pool *DBPool // pool mode — writer checked out only during commit
 }
 
 // NewBulkInserter creates a BulkInserter that batches INSERT statements for
 // the given *Conn. prefix should be in the form "INSERT INTO table (col1, col2)"
 // or "INSERT OR REPLACE INTO table (col1, col2)". onConflict is appended after
 // the VALUES list (e.g. "ON CONFLICT(col) DO UPDATE SET ...") or may be empty.
-// The batch size defaults to MaxBinds.
+// The batch size defaults to GetMaxBinds().
 func NewBulkInserter(prefix string, onConflict string, conn *Conn) *BulkInserter {
 	return &BulkInserter{
 		prefix:     prefix,
 		onConflict: onConflict,
-		size:       MaxBinds,
+		size:       maxBinds,
 		conn:       conn,
 	}
 }
 
 // NewBulkInserterPool creates a BulkInserter that uses the writer connection
-// from a DBPool. This is the recommended constructor for external callers who
-// don't have direct access to a *Conn. The writer is checked out once and held
-// for the lifetime of the inserter.
+// from a DBPool. The writer is NOT checked out at creation time — it is
+// checked out only during commit/Done, so setup work does not block other
+// writers. This is the recommended constructor for callers using a pool.
 func NewBulkInserterPool(prefix string, onConflict string, pool *DBPool) *BulkInserter {
 	return &BulkInserter{
 		prefix:     prefix,
 		onConflict: onConflict,
-		size:       MaxBinds,
-		conn:       pool.wconn,
+		size:       maxBinds,
+		pool:       pool,
 	}
 }
 
@@ -1391,10 +1426,25 @@ func (o *BulkInserter) commit() (err error) {
 		b.WriteString(" ")
 		b.WriteString(o.onConflict)
 	}
-	// Bypass the statement cache: the SQL varies with the number of buffered
-	// rows, so caching it would leak prepared statements unboundedly. Prepare
-	// directly on the underlying sqlite3.Conn and close the stmt after use.
-	stmt, err := o.conn.db.Prepare(b.String())
+	sql := b.String()
+
+	// When created via NewBulkInserterPool, check out the writer for
+	// the duration of the commit only — not the whole inserter lifetime.
+	if o.pool != nil {
+		wconn := o.pool.checkoutWriter()
+		if wconn == nil {
+			return ErrPoolClosed
+		}
+		defer o.pool.checkinWriter()
+		return o.execBulk(wconn, sql, allArgs)
+	}
+	return o.execBulk(o.conn, sql, allArgs)
+}
+
+// execBulk prepares, executes, and closes a bulk INSERT statement.
+// The statement cache is bypassed because the SQL varies with row count.
+func (o *BulkInserter) execBulk(c *Conn, sql string, allArgs []interface{}) error {
+	stmt, err := c.db.Prepare(sql)
 	if err != nil {
 		return err
 	}
@@ -1417,8 +1467,8 @@ func InSQL[T comparable](sql string, in []T) (string, error) {
 	if len(in) == 0 {
 		return "", fmt.Errorf("InSQL: empty input would produce invalid \"IN ()\"")
 	}
-	if len(in) > MaxBinds {
-		return "", fmt.Errorf("cannot have more than %d bindvars", MaxBinds)
+	if len(in) > maxBinds {
+		return "", fmt.Errorf("cannot have more than %d bindvars", maxBinds)
 	}
 	binds := make([]string, len(in))
 	for i := range in {

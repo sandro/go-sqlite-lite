@@ -105,7 +105,7 @@ func BenchmarkBulkInserterBatched(b *testing.B) {
 		mustRes(pool.Exec("DELETE FROM bench"))
 		inserter := NewBulkInserterPool("INSERT INTO bench (name, description)", "", pool)
 		// Fill up to the bind limit (2 args per row → size/2 rows per batch).
-		for j := 0; j < MaxBinds/2; j++ {
+		for j := 0; j < GetMaxBinds()/2; j++ {
 			if err := inserter.Add("name", "desc"); err != nil {
 				b.Fatal(err)
 			}
