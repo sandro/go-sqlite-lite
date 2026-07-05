@@ -1,0 +1,720 @@
+package slite
+
+import (
+	"testing"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Scalar types: bool, int variants, uint variants, float, string, []byte
+// ---------------------------------------------------------------------------
+
+func TestScanBool(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (active INTEGER, label TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 'yes')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (0, 'no')"))
+
+	type Row struct {
+		Active bool   `db:"active"`
+		Label  string `db:"label"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT active, label FROM t ORDER BY active"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0].Active != false || rows[0].Label != "no" {
+		t.Errorf("row 0: got %+v, want {false no}", rows[0])
+	}
+	if rows[1].Active != true || rows[1].Label != "yes" {
+		t.Errorf("row 1: got %+v, want {true yes}", rows[1])
+	}
+}
+
+func TestScanIntVariants(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (val INTEGER, label TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (42, 'x')"))
+
+	// Each struct has a second field to ensure adequate allocation size
+	// for checkptr compatibility with -race.
+
+	// int
+	type RowInt struct {
+		Val   int    `db:"val"`
+		Label string `db:"label"`
+	}
+	var ri RowInt
+	if err := conn.Get(&ri, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ri.Val != 42 {
+		t.Errorf("int: got %d, want 42", ri.Val)
+	}
+
+	// int8
+	type RowInt8 struct {
+		Val   int8   `db:"val"`
+		Label string `db:"label"`
+	}
+	var ri8 RowInt8
+	if err := conn.Get(&ri8, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ri8.Val != 42 {
+		t.Errorf("int8: got %d, want 42", ri8.Val)
+	}
+
+	// int16
+	type RowInt16 struct {
+		Val   int16  `db:"val"`
+		Label string `db:"label"`
+	}
+	var ri16 RowInt16
+	if err := conn.Get(&ri16, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ri16.Val != 42 {
+		t.Errorf("int16: got %d, want 42", ri16.Val)
+	}
+
+	// int32
+	type RowInt32 struct {
+		Val   int32  `db:"val"`
+		Label string `db:"label"`
+	}
+	var ri32 RowInt32
+	if err := conn.Get(&ri32, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ri32.Val != 42 {
+		t.Errorf("int32: got %d, want 42", ri32.Val)
+	}
+
+	// int64
+	type RowInt64 struct {
+		Val   int64  `db:"val"`
+		Label string `db:"label"`
+	}
+	var ri64 RowInt64
+	if err := conn.Get(&ri64, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ri64.Val != 42 {
+		t.Errorf("int64: got %d, want 42", ri64.Val)
+	}
+}
+
+func TestScanUintVariants(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (val INTEGER, label TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (255, 'x')"))
+
+	// uint
+	type RowUint struct {
+		Val   uint   `db:"val"`
+		Label string `db:"label"`
+	}
+	var ru RowUint
+	if err := conn.Get(&ru, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ru.Val != 255 {
+		t.Errorf("uint: got %d, want 255", ru.Val)
+	}
+
+	// uint8
+	type RowUint8 struct {
+		Val   uint8  `db:"val"`
+		Label string `db:"label"`
+	}
+	var ru8 RowUint8
+	if err := conn.Get(&ru8, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ru8.Val != 255 {
+		t.Errorf("uint8: got %d, want 255", ru8.Val)
+	}
+
+	// uint16
+	type RowUint16 struct {
+		Val   uint16 `db:"val"`
+		Label string `db:"label"`
+	}
+	var ru16 RowUint16
+	if err := conn.Get(&ru16, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ru16.Val != 255 {
+		t.Errorf("uint16: got %d, want 255", ru16.Val)
+	}
+
+	// uint32
+	type RowUint32 struct {
+		Val   uint32 `db:"val"`
+		Label string `db:"label"`
+	}
+	var ru32 RowUint32
+	if err := conn.Get(&ru32, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ru32.Val != 255 {
+		t.Errorf("uint32: got %d, want 255", ru32.Val)
+	}
+
+	// uint64
+	type RowUint64 struct {
+		Val   uint64 `db:"val"`
+		Label string `db:"label"`
+	}
+	var ru64 RowUint64
+	if err := conn.Get(&ru64, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if ru64.Val != 255 {
+		t.Errorf("uint64: got %d, want 255", ru64.Val)
+	}
+}
+
+func TestScanFloat32(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (val REAL, label TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3.14, 'pi')"))
+
+	type Row struct {
+		Val   float32 `db:"val"`
+		Label string  `db:"label"`
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT val, label FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	// float32 precision: compare within epsilon.
+	if row.Val < 3.13 || row.Val > 3.15 {
+		t.Errorf("float32: got %f, want ~3.14", row.Val)
+	}
+}
+
+func TestScanFloat64(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (val REAL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3.14159265358979)"))
+
+	type Row struct{ Val float64 `db:"val"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT val FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.Val != 3.14159265358979 {
+		t.Errorf("float64: got %f, want 3.14159265358979", row.Val)
+	}
+}
+
+func TestScanString(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (val TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('hello world')"))
+
+	type Row struct{ Val string `db:"val"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT val FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.Val != "hello world" {
+		t.Errorf("got %q, want %q", row.Val, "hello world")
+	}
+}
+
+func TestScanByteSlice(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (data BLOB)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (x'DEADBEEF')"))
+
+	type Row struct{ Data []byte `db:"data"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT data FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if len(row.Data) != 4 || row.Data[0] != 0xDE || row.Data[1] != 0xAD || row.Data[2] != 0xBE || row.Data[3] != 0xEF {
+		t.Errorf("got %x, want DEADBEEF", row.Data)
+	}
+}
+
+func TestScanByteSliceNull(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (data BLOB)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (NULL)"))
+
+	type Row struct{ Data []byte `db:"data"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT data FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.Data != nil {
+		t.Errorf("got %v, want nil for NULL blob", row.Data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// time.Time scanning from different SQLite column types
+// ---------------------------------------------------------------------------
+
+func TestScanTimeFromInteger(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (created_at INTEGER)"))
+	// Store a Unix timestamp: 2024-01-15 00:00:00 UTC.
+	ts := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC).Unix()
+	mustRes(conn.Exec("INSERT INTO t VALUES (?)", ts))
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.CreatedAt.Unix() != ts {
+		t.Errorf("got %v, want Unix %d", row.CreatedAt, ts)
+	}
+}
+
+func TestScanTimeFromFloat(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (created_at REAL)"))
+	// Float timestamp with sub-second precision.
+	ts := 1705276800.5 // some Unix time with .5 seconds
+	mustRes(conn.Exec("INSERT INTO t VALUES (?)", ts))
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	// Should have parsed the float as Unix timestamp.
+	if row.CreatedAt.IsZero() {
+		t.Error("expected non-zero time from float")
+	}
+	if row.CreatedAt.Unix() != 1705276800 {
+		t.Errorf("got Unix %d, want 1705276800", row.CreatedAt.Unix())
+	}
+}
+
+func TestScanTimeFromString(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// RFC3339 format.
+	mustRes(conn.Exec("CREATE TABLE t1 (created_at TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t1 VALUES ('2024-06-15T12:30:00Z')"))
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t1"); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2024, 6, 15, 12, 30, 0, 0, time.UTC)
+	if !row.CreatedAt.Equal(want) {
+		t.Errorf("RFC3339: got %v, want %v", row.CreatedAt, want)
+	}
+
+	// SQLite datetime format: "2006-01-02 15:04:05"
+	mustRes(conn.Exec("CREATE TABLE t2 (created_at TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t2 VALUES ('2024-06-15 12:30:00')"))
+
+	var row2 Row
+	if err := conn.Get(&row2, "SELECT created_at FROM t2"); err != nil {
+		t.Fatal(err)
+	}
+	// time.Parse with "2006-01-02 15:04:05" gives UTC.
+	want2 := time.Date(2024, 6, 15, 12, 30, 0, 0, time.UTC)
+	if !row2.CreatedAt.Equal(want2) {
+		t.Errorf("datetime: got %v, want %v", row2.CreatedAt, want2)
+	}
+}
+
+func TestScanTimeFromNull(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (created_at TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (NULL)"))
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if !row.CreatedAt.IsZero() {
+		t.Errorf("expected zero time for NULL, got %v", row.CreatedAt)
+	}
+}
+
+func TestScanTimeFromStringAsUnixTimestamp(t *testing.T) {
+	// A string that looks like a Unix timestamp (numeric string).
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (created_at TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('1705276800')"))
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.CreatedAt.Unix() != 1705276800 {
+		t.Errorf("got Unix %d, want 1705276800", row.CreatedAt.Unix())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Nullable columns via Query + Row.IsNull
+// ---------------------------------------------------------------------------
+
+// Note: Pointer fields (*string, *int64) in struct scanning are not supported
+// by the current scan plan. For nullable columns, use Query with IsNull/Value
+// accessors, or use the zero value convention (empty string, 0, zero time).
+
+func TestNullableColumnsViaQuery(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (name TEXT, age INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('alice', 30)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (NULL, NULL)"))
+
+	type Result struct {
+		Name     string
+		Age      int64
+		NameNull bool
+		AgeNull  bool
+	}
+	var results []Result
+	err = conn.Query("SELECT name, age FROM t ORDER BY name", func(row *Row) error {
+		results = append(results, Result{
+			Name:     row.Text("name"),
+			Age:      row.Int("age"),
+			NameNull: row.IsNull("name"),
+			AgeNull:  row.IsNull("age"),
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+
+	// NULL row sorts first (empty string < "alice").
+	if !results[0].NameNull || !results[0].AgeNull {
+		t.Errorf("row 0: expected nulls, got %+v", results[0])
+	}
+	if results[0].Name != "" || results[0].Age != 0 {
+		t.Errorf("row 0: null columns should return zero values, got %+v", results[0])
+	}
+
+	if results[1].NameNull || results[1].AgeNull {
+		t.Errorf("row 1: expected non-nulls, got %+v", results[1])
+	}
+	if results[1].Name != "alice" || results[1].Age != 30 {
+		t.Errorf("row 1: got %+v, want {alice 30 false false}", results[1])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Nested struct scanning
+// ---------------------------------------------------------------------------
+
+func TestScanNestedStruct(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE users (name TEXT)"))
+	mustRes(conn.Exec("CREATE TABLE addresses (city TEXT, user_name TEXT)"))
+	mustRes(conn.Exec("INSERT INTO users VALUES ('alice')"))
+	mustRes(conn.Exec("INSERT INTO addresses VALUES ('NYC', 'alice')"))
+
+	type Address struct {
+		City string `db:"city"`
+	}
+	type User struct {
+		Name    string  `db:"name"`
+		Address Address // nested struct — columns matched by field name
+	}
+
+	var user User
+	if err := conn.Get(&user, "SELECT u.name, a.city FROM users u JOIN addresses a ON a.user_name = u.name"); err != nil {
+		t.Fatal(err)
+	}
+	if user.Name != "alice" {
+		t.Errorf("Name = %q, want alice", user.Name)
+	}
+	if user.Address.City != "NYC" {
+		t.Errorf("Address.City = %q, want NYC", user.Address.City)
+	}
+}
+
+func TestScanDeeplyNestedStruct(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (a TEXT, b TEXT, c TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('x', 'y', 'z')"))
+
+	type Level2 struct {
+		C string `db:"c"`
+	}
+	type Level1 struct {
+		B  string `db:"b"`
+		L2 Level2
+	}
+	type Root struct {
+		A  string `db:"a"`
+		L1 Level1
+	}
+
+	var root Root
+	if err := conn.Get(&root, "SELECT a, b, c FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if root.A != "x" {
+		t.Errorf("A = %q, want x", root.A)
+	}
+	if root.L1.B != "y" {
+		t.Errorf("L1.B = %q, want y", root.L1.B)
+	}
+	if root.L1.L2.C != "z" {
+		t.Errorf("L1.L2.C = %q, want z", root.L1.L2.C)
+	}
+}
+
+func TestScanWithDbTag(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (user_id INTEGER, full_name TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 'Alice Smith')"))
+
+	type Row struct {
+		UserID   int64  `db:"user_id"`
+		FullName string `db:"full_name"`
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT user_id, full_name FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.UserID != 1 || row.FullName != "Alice Smith" {
+		t.Errorf("got %+v, want {1 Alice Smith}", row)
+	}
+}
+
+func TestScanIgnoresUnmatchedColumns(t *testing.T) {
+	// If the query returns columns that don't match any struct field,
+	// they should be silently ignored (no error).
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, name TEXT, extra TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 'alice', 'ignored')"))
+
+	type Row struct {
+		ID   int64  `db:"id"`
+		Name string `db:"name"`
+		// no field for "extra"
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT id, name, extra FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != 1 || row.Name != "alice" {
+		t.Errorf("got %+v, want {1 alice}", row)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SetTimeSetter — custom time parser
+// ---------------------------------------------------------------------------
+
+func TestSetTimeSetter(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (created_at TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('15/06/2024')"))
+
+	// Set a custom time setter that handles DD/MM/YYYY format.
+	SetTimeSetter(func(val any) (time.Time, bool) {
+		if s, ok := val.(string); ok {
+			tm, err := time.Parse("02/01/2006", s)
+			if err == nil {
+				return tm, true
+			}
+		}
+		// Fall back to the default for other types.
+		return setTimeFromValue(val)
+	})
+	defer SetTimeSetter(setTimeFromValue) // restore default
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
+	if !row.CreatedAt.Equal(want) {
+		t.Errorf("got %v, want %v", row.CreatedAt, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SetSupportedTimeFormats — custom format list
+// ---------------------------------------------------------------------------
+
+func TestSetSupportedTimeFormats(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (created_at TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('2024/06/15 12:30')"))
+
+	// The default formats won't parse this. Add a custom one.
+	SetSupportedTimeFormats([]string{
+		"2006/01/02 15:04",
+		time.RFC3339,
+	})
+	defer SetSupportedTimeFormats([]string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+	}) // restore defaults
+
+	type Row struct{ CreatedAt time.Time `db:"created_at"` }
+	var row Row
+	if err := conn.Get(&row, "SELECT created_at FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2024, 6, 15, 12, 30, 0, 0, time.UTC)
+	if !row.CreatedAt.Equal(want) {
+		t.Errorf("got %v, want %v", row.CreatedAt, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mixed types in a single struct
+// ---------------------------------------------------------------------------
+
+func TestScanAllTypesInOneStruct(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec(`CREATE TABLE t (
+		b INTEGER,
+		i INTEGER,
+		u INTEGER,
+		f REAL,
+		s TEXT,
+		data BLOB,
+		ts TEXT
+	)`))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, -42, 255, 3.14, 'hello', x'CAFE', '2024-06-15T12:00:00Z')"))
+
+	type Row struct {
+		B    bool      `db:"b"`
+		I    int64     `db:"i"`
+		U    uint32    `db:"u"`
+		F    float64   `db:"f"`
+		S    string    `db:"s"`
+		Data []byte    `db:"data"`
+		Ts   time.Time `db:"ts"`
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT b, i, u, f, s, data, ts FROM t"); err != nil {
+		t.Fatal(err)
+	}
+	if row.B != true {
+		t.Errorf("B = %v, want true", row.B)
+	}
+	if row.I != -42 {
+		t.Errorf("I = %d, want -42", row.I)
+	}
+	if row.U != 255 {
+		t.Errorf("U = %d, want 255", row.U)
+	}
+	if row.F != 3.14 {
+		t.Errorf("F = %f, want 3.14", row.F)
+	}
+	if row.S != "hello" {
+		t.Errorf("S = %q, want hello", row.S)
+	}
+	if len(row.Data) != 2 || row.Data[0] != 0xCA || row.Data[1] != 0xFE {
+		t.Errorf("Data = %x, want CAFE", row.Data)
+	}
+	want := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	if !row.Ts.Equal(want) {
+		t.Errorf("Ts = %v, want %v", row.Ts, want)
+	}
+}
