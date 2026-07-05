@@ -232,26 +232,40 @@ if user.Name == "" {
 ```
 
 When NULL genuinely means something different from empty (e.g. "not yet set" vs
-"explicitly cleared"), use `Query` with `IsNull`:
+"explicitly cleared"), use pointer fields:
+
+```go
+type User struct {
+    ID   int64   `db:"id"`
+    Name *string `db:"name"` // nil = NULL, &"" = empty string
+    Age  *int64  `db:"age"`  // nil = NULL, &0 = zero
+}
+
+var user User
+db.Get(&user, "SELECT id, name, age FROM users WHERE id = ?", id)
+if user.Name == nil {
+    // not yet set — prompt user to fill it in
+} else if *user.Name == "" {
+    // explicitly cleared
+}
+```
+
+Supported pointer types: `*string`, `*int64`, `*int`, `*float64`, `*bool`,
+`*[]byte`. NULL columns set the pointer to nil; non-NULL columns allocate and
+assign. This is the same convention as `database/sql`.
+
+For the `Query` callback path, `Row.IsNull` is also available:
 
 ```go
 db.Query("SELECT name FROM users WHERE id = ?", func(row *slite.Row) error {
     if row.IsNull("name") {
-        // not yet set — prompt user to fill it in
-    } else if row.Text("name") == "" {
-        // explicitly cleared
+        // NULL
     } else {
-        // has a real name
+        name := row.Text("name") // "" if empty, never nil
     }
     return nil
 }, id)
 ```
-
-> **Why no `*string` / `sql.NullString` scanning?** slite's struct scanner uses
-> precomputed unsafe pointer offsets for zero-allocation hot-path scanning.
-> Pointer fields would require per-row allocation and a more complex scan plan.
-> The `Query` + `IsNull` pattern handles the rare cases where NULL semantics
-> matter, and `NOT NULL DEFAULT` handles the common case at the schema level.
 
 ### Batching writes in a transaction
 

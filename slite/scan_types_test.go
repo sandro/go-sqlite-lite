@@ -419,9 +419,9 @@ func TestScanTimeFromStringAsUnixTimestamp(t *testing.T) {
 // Nullable columns via Query + Row.IsNull
 // ---------------------------------------------------------------------------
 
-// Note: Pointer fields (*string, *int64) in struct scanning are not supported
-// by the current scan plan. For nullable columns, use Query with IsNull/Value
-// accessors, or use the zero value convention (empty string, 0, zero time).
+// Pointer fields (*string, *int64, *float64, *bool, *int, *[]byte) are
+// supported for nullable columns. nil pointer = NULL, non-nil = value.
+// For columns without pointer fields, you can also use Query with IsNull.
 
 func TestNullableColumnsViaQuery(t *testing.T) {
 	conn, err := NewConn(":memory:", false)
@@ -712,6 +712,237 @@ func TestScanPointerByteSlice(t *testing.T) {
 	}
 	if len(*row3.Data) != 0 {
 		t.Errorf("row 3: Data = %x, want empty slice", *row3.Data)
+	}
+}
+
+func TestScanPointerString(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, name TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 'alice')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3, '')"))
+
+	type Row struct {
+		ID   int64   `db:"id"`
+		Name *string `db:"name"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, name FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+
+	// Non-NULL string.
+	if rows[0].Name == nil || *rows[0].Name != "alice" {
+		t.Errorf("row 0: Name = %v, want *alice", rows[0].Name)
+	}
+	// NULL → nil pointer.
+	if rows[1].Name != nil {
+		t.Errorf("row 1: Name = %v, want nil", rows[1].Name)
+	}
+	// Empty string → non-nil pointer to "".
+	if rows[2].Name == nil || *rows[2].Name != "" {
+		t.Errorf("row 2: Name = %v, want *\"\"", rows[2].Name)
+	}
+}
+
+func TestScanPointerInt64(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, val INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 42)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3, 0)"))
+
+	type Row struct {
+		ID  int64  `db:"id"`
+		Val *int64 `db:"val"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, val FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+
+	if rows[0].Val == nil || *rows[0].Val != 42 {
+		t.Errorf("row 0: Val = %v, want *42", rows[0].Val)
+	}
+	if rows[1].Val != nil {
+		t.Errorf("row 1: Val = %v, want nil", rows[1].Val)
+	}
+	// 0 is a valid value, not NULL.
+	if rows[2].Val == nil || *rows[2].Val != 0 {
+		t.Errorf("row 2: Val = %v, want *0", rows[2].Val)
+	}
+}
+
+func TestScanPointerInt(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, val INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 99)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+
+	type Row struct {
+		ID  int64 `db:"id"`
+		Val *int  `db:"val"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, val FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Val == nil || *rows[0].Val != 99 {
+		t.Errorf("row 0: Val = %v, want *99", rows[0].Val)
+	}
+	if rows[1].Val != nil {
+		t.Errorf("row 1: Val = %v, want nil", rows[1].Val)
+	}
+}
+
+func TestScanPointerFloat64(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, val REAL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 3.14)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3, 0.0)"))
+
+	type Row struct {
+		ID  int64    `db:"id"`
+		Val *float64 `db:"val"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, val FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Val == nil || *rows[0].Val != 3.14 {
+		t.Errorf("row 0: Val = %v, want *3.14", rows[0].Val)
+	}
+	if rows[1].Val != nil {
+		t.Errorf("row 1: Val = %v, want nil", rows[1].Val)
+	}
+	if rows[2].Val == nil || *rows[2].Val != 0.0 {
+		t.Errorf("row 2: Val = %v, want *0.0", rows[2].Val)
+	}
+}
+
+func TestScanPointerBool(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, active INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 1)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3, 0)"))
+
+	type Row struct {
+		ID     int64 `db:"id"`
+		Active *bool `db:"active"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, active FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Active == nil || *rows[0].Active != true {
+		t.Errorf("row 0: Active = %v, want *true", rows[0].Active)
+	}
+	if rows[1].Active != nil {
+		t.Errorf("row 1: Active = %v, want nil", rows[1].Active)
+	}
+	// false is a valid value, not NULL.
+	if rows[2].Active == nil || *rows[2].Active != false {
+		t.Errorf("row 2: Active = %v, want *false", rows[2].Active)
+	}
+}
+
+// TestScanPointerAllTypes verifies all pointer types together in one struct,
+// covering the common "nullable row from a LEFT JOIN" pattern.
+func TestScanPointerAllTypes(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec(`CREATE TABLE t (
+		id     INTEGER PRIMARY KEY,
+		name   TEXT,
+		count  INTEGER,
+		score  REAL,
+		active INTEGER,
+		data   BLOB
+	)`))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, 'alice', 10, 3.14, 1, x'CAFE')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL, NULL, NULL, NULL, NULL)"))
+
+	type Row struct {
+		ID     int64    `db:"id"`
+		Name   *string  `db:"name"`
+		Count  *int64   `db:"count"`
+		Score  *float64 `db:"score"`
+		Active *bool    `db:"active"`
+		Data   *[]byte  `db:"data"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, name, count, score, active, data FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+
+	// Row 1: all non-NULL.
+	r := rows[0]
+	if r.Name == nil || *r.Name != "alice" {
+		t.Errorf("row 0 Name = %v", r.Name)
+	}
+	if r.Count == nil || *r.Count != 10 {
+		t.Errorf("row 0 Count = %v", r.Count)
+	}
+	if r.Score == nil || *r.Score != 3.14 {
+		t.Errorf("row 0 Score = %v", r.Score)
+	}
+	if r.Active == nil || *r.Active != true {
+		t.Errorf("row 0 Active = %v", r.Active)
+	}
+	if r.Data == nil || len(*r.Data) != 2 {
+		t.Errorf("row 0 Data = %v", r.Data)
+	}
+
+	// Row 2: all NULL.
+	r = rows[1]
+	if r.Name != nil {
+		t.Errorf("row 1 Name = %v, want nil", r.Name)
+	}
+	if r.Count != nil {
+		t.Errorf("row 1 Count = %v, want nil", r.Count)
+	}
+	if r.Score != nil {
+		t.Errorf("row 1 Score = %v, want nil", r.Score)
+	}
+	if r.Active != nil {
+		t.Errorf("row 1 Active = %v, want nil", r.Active)
+	}
+	if r.Data != nil {
+		t.Errorf("row 1 Data = %v, want nil", r.Data)
 	}
 }
 

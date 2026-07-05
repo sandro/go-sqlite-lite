@@ -983,9 +983,10 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 		}
 	case reflect.Ptr:
 		elemType := field.Type.Elem()
-		if elemType == byteArrayType {
+		elemKind := elemType.Kind()
+		switch {
+		case elemType == byteArrayType:
 			// *[]byte: nil pointer = NULL, non-nil = blob data.
-			// This is the database/sql convention for nullable blobs.
 			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
 				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
 					*(**[]byte)(unsafe.Pointer(uintptr(p) + offset)) = nil
@@ -998,7 +999,74 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 				*(**[]byte)(unsafe.Pointer(uintptr(p) + offset)) = &v
 				return nil
 			}
-		} else {
+		case elemKind == reflect.String:
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(**string)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				v, _, err := stmt.ColumnText(col)
+				if err != nil {
+					return err
+				}
+				*(**string)(unsafe.Pointer(uintptr(p) + offset)) = &v
+				return nil
+			}
+		case elemKind == reflect.Int64:
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(**int64)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				v, _, err := stmt.ColumnInt64(col)
+				if err != nil {
+					return err
+				}
+				*(**int64)(unsafe.Pointer(uintptr(p) + offset)) = &v
+				return nil
+			}
+		case elemKind == reflect.Int:
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(**int)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				v, _, err := stmt.ColumnInt64(col)
+				if err != nil {
+					return err
+				}
+				i := int(v)
+				*(**int)(unsafe.Pointer(uintptr(p) + offset)) = &i
+				return nil
+			}
+		case elemKind == reflect.Float64:
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(**float64)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				v, _, err := stmt.ColumnDouble(col)
+				if err != nil {
+					return err
+				}
+				*(**float64)(unsafe.Pointer(uintptr(p) + offset)) = &v
+				return nil
+			}
+		case elemKind == reflect.Bool:
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(**bool)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				v, _, err := stmt.ColumnInt64(col)
+				if err != nil {
+					return err
+				}
+				b := v != 0
+				*(**bool)(unsafe.Pointer(uintptr(p) + offset)) = &b
+				return nil
+			}
+		default:
 			// Generic pointer: nil on NULL, reflect fallback otherwise.
 			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
 				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
