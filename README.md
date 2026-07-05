@@ -204,6 +204,55 @@ err := db.Query("SELECT id, slug FROM pages", func(row *slite.Row) error {
 })
 ```
 
+### Handling NULLs
+
+`Get` and `Select` scan into structs, where NULL columns become Go zero values
+(`""`, `0`, zero `time.Time`). This is fine most of the time — and the simplest
+approach is to avoid the ambiguity at the schema level:
+
+```sql
+CREATE TABLE users (
+    name TEXT    NOT NULL DEFAULT '',
+    age  INTEGER NOT NULL DEFAULT 0
+);
+```
+
+Now empty string *is* the only empty state. No NULL/zero confusion. This is the
+right answer for most columns.
+
+When your business logic doesn't care about the difference (e.g. you show
+"Unknown" for both NULL and empty), just use the zero value:
+
+```go
+var user User
+db.Get(&user, "SELECT name, age FROM users WHERE id = ?", id)
+if user.Name == "" {
+    // NULL or empty — doesn't matter, show "Unknown"
+}
+```
+
+When NULL genuinely means something different from empty (e.g. "not yet set" vs
+"explicitly cleared"), use `Query` with `IsNull`:
+
+```go
+db.Query("SELECT name FROM users WHERE id = ?", func(row *slite.Row) error {
+    if row.IsNull("name") {
+        // not yet set — prompt user to fill it in
+    } else if row.Text("name") == "" {
+        // explicitly cleared
+    } else {
+        // has a real name
+    }
+    return nil
+}, id)
+```
+
+> **Why no `*string` / `sql.NullString` scanning?** slite's struct scanner uses
+> precomputed unsafe pointer offsets for zero-allocation hot-path scanning.
+> Pointer fields would require per-row allocation and a more complex scan plan.
+> The `Query` + `IsNull` pattern handles the rare cases where NULL semantics
+> matter, and `NOT NULL DEFAULT` handles the common case at the schema level.
+
 ### Batching writes in a transaction
 
 Each `Exec` acquires the writer for one statement. When a request does several
