@@ -662,6 +662,97 @@ func TestSetSupportedTimeFormats(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// *[]byte (pointer-to-byte-slice) scanning
+// ---------------------------------------------------------------------------
+
+func TestScanPointerByteSlice(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, data BLOB)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, x'DEADBEEF')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (3, x'')")) // empty blob
+
+	type Row struct {
+		ID   int64   `db:"id"`
+		Data *[]byte `db:"data"`
+	}
+
+	// Non-NULL blob.
+	var row1 Row
+	if err := conn.Get(&row1, "SELECT id, data FROM t WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if row1.Data == nil {
+		t.Fatal("row 1: Data is nil, want *[]byte{0xDE,0xAD,0xBE,0xEF}")
+	}
+	if len(*row1.Data) != 4 || (*row1.Data)[0] != 0xDE || (*row1.Data)[3] != 0xEF {
+		t.Errorf("row 1: Data = %x, want DEADBEEF", *row1.Data)
+	}
+
+	// NULL blob — pointer should be nil.
+	var row2 Row
+	if err := conn.Get(&row2, "SELECT id, data FROM t WHERE id = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if row2.Data != nil {
+		t.Errorf("row 2: Data = %v, want nil for NULL blob", row2.Data)
+	}
+
+	// Empty blob — pointer should be non-nil, pointing to empty slice.
+	var row3 Row
+	if err := conn.Get(&row3, "SELECT id, data FROM t WHERE id = 3"); err != nil {
+		t.Fatal(err)
+	}
+	if row3.Data == nil {
+		t.Fatal("row 3: Data is nil, want *[]byte{} (empty blob)")
+	}
+	if len(*row3.Data) != 0 {
+		t.Errorf("row 3: Data = %x, want empty slice", *row3.Data)
+	}
+}
+
+func TestScanPointerByteSliceViaSelect(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER, data BLOB)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1, x'CAFE')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (2, NULL)"))
+
+	type Row struct {
+		ID   int64   `db:"id"`
+		Data *[]byte `db:"data"`
+	}
+
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, data FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+
+	// Row 1: non-NULL blob.
+	if rows[0].Data == nil {
+		t.Fatal("row 0: Data is nil, want *[]byte")
+	}
+	if len(*rows[0].Data) != 2 || (*rows[0].Data)[0] != 0xCA || (*rows[0].Data)[1] != 0xFE {
+		t.Errorf("row 0: Data = %x, want CAFE", *rows[0].Data)
+	}
+
+	// Row 2: NULL blob.
+	if rows[1].Data != nil {
+		t.Errorf("row 1: Data = %v, want nil", rows[1].Data)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Mixed types in a single struct
 // ---------------------------------------------------------------------------
 

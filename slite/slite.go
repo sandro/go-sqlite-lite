@@ -982,15 +982,32 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 			}
 		}
 	case reflect.Ptr:
-		// nil pointer → allocate via reflect.New + convertAssign (rare path).
-		entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
-			if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
-				*(*unsafe.Pointer)(unsafe.Pointer(uintptr(p) + offset)) = nil
+		elemType := field.Type.Elem()
+		if elemType == byteArrayType {
+			// *[]byte: nil pointer = NULL, non-nil = blob data.
+			// This is the database/sql convention for nullable blobs.
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(**[]byte)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				v, err := stmt.ColumnBlob(col)
+				if err != nil {
+					return err
+				}
+				*(**[]byte)(unsafe.Pointer(uintptr(p) + offset)) = &v
 				return nil
 			}
-			// Fall back to reflection for pointer-to-struct/other types.
-			vp := reflect.NewAt(field.Type, unsafe.Pointer(uintptr(p)+offset))
-			return stmt.Scan(vp.Interface())
+		} else {
+			// Generic pointer: nil on NULL, reflect fallback otherwise.
+			entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+				if stmt.ColumnType(col) == sqlite3.SQLITE_NULL {
+					*(*unsafe.Pointer)(unsafe.Pointer(uintptr(p) + offset)) = nil
+					return nil
+				}
+				vp := reflect.NewAt(field.Type, unsafe.Pointer(uintptr(p)+offset))
+				return stmt.Scan(vp.Interface())
+			}
 		}
 	default:
 		// Interface or other: fall back to stmt.Scan via reflection per row.
