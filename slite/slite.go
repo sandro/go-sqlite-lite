@@ -269,7 +269,7 @@ func (o *Conn) Get(dest interface{}, sql string, args ...interface{}) (retErr er
 	}
 	elem := v.Elem()
 	if elem.Kind() != reflect.Struct {
-		return fmt.Errorf("slite: dest must point to a struct, got %s", elem.Kind())
+		return fmt.Errorf("slite: dest must point to a struct, got %s; for scalar values use Query with row.Int64(), row.Text(), etc.", elem.Kind())
 	}
 	plan, err := o.cachedPlan(sql, elem.Type(), stmt)
 	if err != nil {

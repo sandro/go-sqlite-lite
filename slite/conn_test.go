@@ -489,3 +489,40 @@ func TestSelectPointerToNonSliceError(t *testing.T) {
 		t.Error("expected error for pointer-to-struct dest, got nil")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Get scalar hint
+// ---------------------------------------------------------------------------
+
+func TestGetScalarHint(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1)"))
+
+	var count int64
+	err = conn.Get(&count, "SELECT COUNT(*) FROM t")
+	if err == nil {
+		t.Fatal("expected error for scalar dest")
+	}
+	want := "row.Int64()"
+	if !containsStr(err.Error(), want) {
+		t.Errorf("error should suggest %s, got: %s", want, err)
+	}
+}
+
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && searchStr(s, substr)
+}
+
+func searchStr(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
