@@ -2,6 +2,7 @@ package slite
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -508,21 +509,7 @@ func TestGetScalarHint(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for scalar dest")
 	}
-	want := "row.Int64()"
-	if !containsStr(err.Error(), want) {
-		t.Errorf("error should suggest %s, got: %s", want, err)
+	if !strings.Contains(err.Error(), "row.Int64()") {
+		t.Errorf("error should suggest row.Int64(), got: %s", err)
 	}
-}
-
-func containsStr(s, substr string) bool {
-	return len(s) >= len(substr) && searchStr(s, substr)
-}
-
-func searchStr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

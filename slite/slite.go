@@ -84,11 +84,26 @@ func (r *execResult) RowsAffected() (int64, error) { return r.rowsAffected, nil 
 type Logger func(sql string, args []interface{}, elapsed time.Duration, err error)
 
 // defaultLogger is invoked when a Conn has no logger set. nil means no logging.
-var defaultLogger Logger
+var (
+	defaultLogger   Logger
+	defaultLoggerMu sync.RWMutex
+)
 
 // SetDefaultLogger sets the package-level logger used by connections that have
 // no per-connection logger. Pass nil to suppress logging globally.
-func SetDefaultLogger(l Logger) { defaultLogger = l }
+func SetDefaultLogger(l Logger) {
+	defaultLoggerMu.Lock()
+	defaultLogger = l
+	defaultLoggerMu.Unlock()
+}
+
+// getDefaultLogger returns the current default logger under the read lock.
+func getDefaultLogger() Logger {
+	defaultLoggerMu.RLock()
+	l := defaultLogger
+	defaultLoggerMu.RUnlock()
+	return l
+}
 
 // Conn is a higher-level connection that wraps a *sqlite3.Conn with a
 // statement cache, a scan-plan cache, and ergonomic query methods (Get,
@@ -100,18 +115,26 @@ type Conn struct {
 	stmtCache map[string]*sqlite3.Stmt
 	planCache map[string]*scanPlan // keyed by SQL string, like stmtCache
 	logger    Logger
+	loggerMu  sync.RWMutex
 	closed    bool
 }
 
 // SetLogger sets the per-connection logger. Pass nil to suppress logging for
 // this connection only. If nil, the package-level default logger (set via
 // SetDefaultLogger) is used, if any.
-func (o *Conn) SetLogger(l Logger) { o.logger = l }
+func (o *Conn) SetLogger(l Logger) {
+	o.loggerMu.Lock()
+	o.logger = l
+	o.loggerMu.Unlock()
+}
 
 // logSQL invokes the logger for this connection, if set. Falls back to the
 // package-level default logger. If both are nil, it is a no-op.
 func (o *Conn) logStart() time.Time {
-	if o.logger != nil || defaultLogger != nil {
+	o.loggerMu.RLock()
+	cl := o.logger
+	o.loggerMu.RUnlock()
+	if cl != nil || getDefaultLogger() != nil {
 		return time.Now()
 	}
 	return time.Time{}
@@ -122,10 +145,13 @@ func (o *Conn) logSQL(sql string, args []interface{}, start time.Time, err error
 		return
 	}
 	elapsed := time.Since(start)
-	if o.logger != nil {
-		o.logger(sql, args, elapsed, err)
-	} else if defaultLogger != nil {
-		defaultLogger(sql, args, elapsed, err)
+	o.loggerMu.RLock()
+	cl := o.logger
+	o.loggerMu.RUnlock()
+	if cl != nil {
+		cl(sql, args, elapsed, err)
+	} else if dl := getDefaultLogger(); dl != nil {
+		dl(sql, args, elapsed, err)
 	} else {
 		return // no logger, skip slow query check too
 	}
