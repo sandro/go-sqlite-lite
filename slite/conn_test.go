@@ -452,3 +452,40 @@ func TestRawConn(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Select type validation (fixes panic on wrong dest type)
+// ---------------------------------------------------------------------------
+
+func TestSelectNonPointerError(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER)"))
+
+	type Row struct{ ID int64 `db:"id"` }
+	var rows []Row
+	err = conn.Select(rows, "SELECT id FROM t") // not a pointer
+	if err == nil {
+		t.Error("expected error for non-pointer dest, got nil")
+	}
+}
+
+func TestSelectPointerToNonSliceError(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES (1)"))
+
+	type Row struct{ ID int64 `db:"id"` }
+	var row Row
+	err = conn.Select(&row, "SELECT id FROM t") // pointer to struct, not slice
+	if err == nil {
+		t.Error("expected error for pointer-to-struct dest, got nil")
+	}
+}

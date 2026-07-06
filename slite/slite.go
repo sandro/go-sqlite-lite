@@ -282,6 +282,16 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) (retErr
 	start := o.logStart()
 	defer func() { o.logSQL(sql, args, start, retErr) }()
 
+	// Validate dest is a pointer to a slice.
+	v := reflect.ValueOf(dest)
+	if v.Kind() != reflect.Ptr {
+		return fmt.Errorf("slite: Select dest must be a pointer to a slice, got %T", dest)
+	}
+	sliceType := v.Type().Elem()
+	if sliceType.Kind() != reflect.Slice {
+		return fmt.Errorf("slite: Select dest must be a pointer to a slice, got pointer to %s", sliceType.Kind())
+	}
+
 	stmt, err := o.Prepare(sql)
 	if err != nil {
 		return err
@@ -291,13 +301,11 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) (retErr
 		return err
 	}
 
-	value := reflect.ValueOf(dest)
-	indirect := reflect.Indirect(value)
-	sliceElem := value.Type().Elem()
-	base := sliceElem.Elem()
+	indirect := v.Elem()
+	base := sliceType.Elem()
 	// Overwrite the destination slice rather than appending, matching the
 	// usual expectation that Select fills dest with the current result set.
-	indirect.Set(reflect.MakeSlice(sliceElem, 0, 0))
+	indirect.Set(reflect.MakeSlice(sliceType, 0, 0))
 
 	hasRow, err := stmt.Step()
 	if err != nil {
