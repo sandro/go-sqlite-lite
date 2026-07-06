@@ -1386,6 +1386,9 @@ func (o *DBPool) Tx(f func(c *Conn) error) (err error) {
 // writer connection, all opened at uri. An error is returned if any
 // connection fails to open.
 func NewDBPool(uri string, size int) (*DBPool, error) {
+	if size < 1 {
+		return nil, fmt.Errorf("slite: NewDBPool requires size >= 1, got %d", size)
+	}
 	wconn, err := NewConn(uri, false)
 	if err != nil {
 		return nil, err

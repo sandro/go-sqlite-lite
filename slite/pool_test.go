@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,23 @@ func newTestPool(t *testing.T, size int) *DBPool {
 // ---------------------------------------------------------------------------
 // DBPool lifecycle
 // ---------------------------------------------------------------------------
+
+func TestNewDBPoolSizeZeroError(t *testing.T) {
+	_, err := NewDBPool(filepath.Join(t.TempDir(), "test.db"), 0)
+	if err == nil {
+		t.Fatal("expected error for size 0")
+	}
+	if !strings.Contains(err.Error(), "size >= 1") {
+		t.Errorf("error should mention size >= 1, got: %s", err)
+	}
+}
+
+func TestNewDBPoolSizeNegativeError(t *testing.T) {
+	_, err := NewDBPool(filepath.Join(t.TempDir(), "test.db"), -1)
+	if err == nil {
+		t.Fatal("expected error for negative size")
+	}
+}
 
 func TestNewDBPool(t *testing.T) {
 	p := newTestPool(t, 2)
