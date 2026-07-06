@@ -787,6 +787,18 @@ func buildScanPlan(typ reflect.Type, colNames []string) (*scanPlan, error) {
 	if err := walkFields(typ, colNames, consumed, matchedField, entries, "", 0); err != nil {
 		return nil, err
 	}
+	// Warn when no query columns matched any struct fields — the caller
+	// will silently get a zero-value struct, which is almost always a bug
+	// (wrong db tags, wrong column aliases, wrong struct type).
+	matched := 0
+	for _, e := range entries {
+		if e != nil {
+			matched++
+		}
+	}
+	if matched == 0 && nCols > 0 {
+		log.Printf("slite: warning: query returned %d columns %v but no fields matched in %s — check your db tags", nCols, colNames, typ.Name())
+	}
 	return &scanPlan{entries: entries}, nil
 }
 
