@@ -1,6 +1,7 @@
 package slite
 
 import (
+	"database/sql"
 	"reflect"
 	"testing"
 )
@@ -398,5 +399,37 @@ func TestNamedDBPool(t *testing.T) {
 	}
 	if len(names) != 2 || names[0] != "grace" || names[1] != "frank" {
 		t.Fatalf("got %v, want [grace frank]", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Named with TextUnmarshaler/Scanner struct fields (zero.String, NullString)
+// ---------------------------------------------------------------------------
+
+func TestNamedWithTextUnmarshalerField(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, title TEXT)"))
+
+	type Row struct {
+		ID    string         `db:"id"`
+		Title sql.NullString `db:"title"`
+	}
+	q, args, err := Named("INSERT INTO t (id, title) VALUES (:id, :title)", &Row{ID: "e1", Title: sql.NullString{String: "hello", Valid: true}})
+	if err != nil {
+		t.Fatalf("Named: %v", err)
+	}
+	if _, err := conn.Exec(q, args...); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	var got Row
+	if err := conn.Get(&got, "SELECT id, title FROM t WHERE id='e1'"); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title.String != "hello" || !got.Title.Valid {
+		t.Errorf("Title = %+v, want {hello true}", got.Title)
 	}
 }

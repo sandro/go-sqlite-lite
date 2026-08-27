@@ -5,6 +5,7 @@ package sqlite3
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -1263,5 +1264,33 @@ func TestOutOfRange(T *testing.T) {
 	_, _, err = s.ColumnRawString(1)
 	if err == nil {
 		t.Fatal("Expected out of range error")
+	}
+}
+
+func TestScanSQLScanner(T *testing.T) {
+	t := begin(T)
+	defer t.skipRestIfFailed()
+
+	c := t.open("")
+	defer t.close(c)
+	t.exec(c, "CREATE TABLE t (id INTEGER, title TEXT, note TEXT)")
+	t.exec(c, "INSERT INTO t VALUES (1, 'hello', NULL)")
+
+	stmt := t.prepare(c, "SELECT id, title, note FROM t")
+	defer t.close(stmt)
+	t.step(stmt, true)
+
+	var id sql.NullInt64
+	var title sql.NullString
+	var note sql.NullString
+	t.scan(stmt, &id, &title, &note)
+	if !id.Valid || id.Int64 != 1 {
+		t.Errorf("id = %+v, want {1 true}", id)
+	}
+	if !title.Valid || title.String != "hello" {
+		t.Errorf("title = %+v, want {hello true}", title)
+	}
+	if note.Valid {
+		t.Errorf("note = %+v, want invalid (NULL)", note)
 	}
 }

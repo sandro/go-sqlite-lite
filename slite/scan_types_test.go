@@ -1,6 +1,7 @@
 package slite
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -1112,5 +1113,69 @@ func TestScanTextUnmarshalerStructSelect(t *testing.T) {
 	}
 	if rows[0].Title.Value != "one" || rows[1].Title.Value != "two" {
 		t.Errorf("titles = %q, %q; want one, two", rows[0].Title.Value, rows[1].Title.Value)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sql.Scanner structs (stdlib sql.NullString etc.)
+// ---------------------------------------------------------------------------
+
+func TestScanSQLNullString(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, title TEXT, note TEXT, n INTEGER)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e1', 'hello', NULL, 42)"))
+
+	type Row struct {
+		ID    string         `db:"id"`
+		Title sql.NullString `db:"title"`
+		Note  sql.NullString `db:"note"`
+		N     sql.NullInt64  `db:"n"`
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT id, title, note, n FROM t WHERE id='e1'"); err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != "e1" {
+		t.Errorf("ID = %q, want e1", row.ID)
+	}
+	if row.Title.String != "hello" || !row.Title.Valid {
+		t.Errorf("Title = %+v, want {hello true}", row.Title)
+	}
+	if row.Note.Valid {
+		t.Errorf("Note = %+v, want invalid (NULL)", row.Note)
+	}
+	if row.N.Int64 != 42 || !row.N.Valid {
+		t.Errorf("N = %+v, want {42 true}", row.N)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// time.Time bind/scan round-trip
+// ---------------------------------------------------------------------------
+
+func TestTimeRoundTripThroughIntegerColumn(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, ts INTEGER)"))
+	want := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e1', ?)", want))
+
+	type Row struct {
+		ID string    `db:"id"`
+		Ts time.Time `db:"ts"`
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT id, ts FROM t WHERE id='e1'"); err != nil {
+		t.Fatal(err)
+	}
+	if !row.Ts.Equal(want) {
+		t.Errorf("Ts = %v, want %v (bind and scan must agree on the unit)", row.Ts, want)
 	}
 }

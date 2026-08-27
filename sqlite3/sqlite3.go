@@ -861,7 +861,12 @@ func (s *Stmt) bindAt(col C.int, v interface{}) error {
 			rc = C.sqlite3_bind_null(s.stmt, col)
 		}
 	case time.Time:
-		rc = C.sqlite3_bind_int64(s.stmt, col, C.sqlite3_int64(v.UnixNano()/1e6))
+		// Store instants as seconds since the Unix epoch, matching the
+		// scan side (setTimeFromValue reads INTEGER columns as Unix
+		// seconds). Milliseconds here would round-trip 1000x off. Callers
+		// needing sub-second precision should bind int64/float64 or text
+		// explicitly.
+		rc = C.sqlite3_bind_int64(s.stmt, col, C.sqlite3_int64(v.Unix()))
 	case time.Duration:
 		rc = C.sqlite3_bind_int64(s.stmt, col, C.sqlite3_int64(int64(v)))
 	case driver.Valuer:
@@ -1088,6 +1093,28 @@ func (s *Stmt) scan(i int, v interface{}) error {
 		*v, err = s.ColumnRawBytes(i)
 	case io.Writer:
 		_, err = v.Write(blob(s.stmt, C.int(i), false))
+	case sql.Scanner:
+		// Convert the column to a driver-style value and hand it to Scan,
+		// mirroring database/sql's conversion.
+		var src interface{}
+		switch s.ColumnType(i) {
+		case SQLITE_NULL:
+			src = nil
+		case SQLITE_INTEGER:
+			src, _, err = s.ColumnInt64(i)
+		case SQLITE_FLOAT:
+			src, _, err = s.ColumnDouble(i)
+		case SQLITE_TEXT:
+			src, _, err = s.ColumnText(i)
+		case SQLITE_BLOB:
+			src, err = s.ColumnBlob(i)
+		default:
+			return pkgErr(MISUSE, "unscannable column type %d for %T", int(i), v)
+		}
+		if err != nil {
+			return err
+		}
+		return v.Scan(src)
 	default:
 		return pkgErr(MISUSE, "unscannable type for column %d (%T)", int(i), v)
 	}

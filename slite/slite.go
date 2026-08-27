@@ -745,6 +745,15 @@ func implementsTextUnmarshaler(t reflect.Type) bool {
 
 var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 
+// implementsScanner reports whether t implements sql.Scanner. Checked on the
+// pointer type for the same reason as implementsTextUnmarshaler: Scan
+// conventionally has a pointer receiver (as with stdlib sql.NullString).
+func implementsScanner(t reflect.Type) bool {
+	return reflect.PointerTo(t).Implements(scannerType)
+}
+
+var scannerType = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
+
 // scanPlan is a cached, pre-computed mapping from query result columns to
 // struct fields. It is built once per (struct type, column set) pair via
 // reflection, then reused across rows using unsafe pointer arithmetic — no
@@ -856,11 +865,12 @@ func walkFields(typ reflect.Type, colNames []string, consumed []bool, matchedFie
 		path := prefix + fieldType.Name
 		absOffset := baseOffset + fieldType.Offset
 		// Scalar-like field (including time.Time and any type implementing
-		// encoding.TextUnmarshaler, e.g. guregu null.v4 zero.String): try
-		// direct column match. TextUnmarshaler structs must be treated as
-		// scalars, not recursed into — their inner fields (like
-		// sql.NullString's String/Valid) never match query columns.
-		if fieldType.Type.Kind() != reflect.Struct || fieldType.Type == timeType || implementsTextUnmarshaler(fieldType.Type) {
+		// encoding.TextUnmarshaler or sql.Scanner, e.g. guregu null.v4
+		// zero.String and stdlib sql.NullString): try direct column match.
+		// Such structs must be treated as scalars, not recursed into — their
+		// inner fields (like sql.NullString's String/Valid) never match
+		// query columns.
+		if fieldType.Type.Kind() != reflect.Struct || fieldType.Type == timeType || implementsTextUnmarshaler(fieldType.Type) || implementsScanner(fieldType.Type) {
 			if !matchedField[path] {
 				if idx := findColumn(colNames, consumed, name); idx >= 0 {
 					entry, err := newScanEntry(fieldType, absOffset)
@@ -1016,7 +1026,7 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 				return nil
 			}
 		} else {
-			// Non-time struct: try UnmarshalText.
+			// Non-time struct: try UnmarshalText, then sql.Scanner.
 			if implementsTextUnmarshaler(field.Type) {
 				entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
 					v, err := stmt.ColumnBlob(col)
@@ -1038,8 +1048,57 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 					typedMemmove(dst, src, field.Type)
 					return nil
 				}
+			} else if implementsScanner(field.Type) {
+				entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
+					// Convert the column to a driver-style value and hand it
+					// to Scan, mirroring database/sql's conversion.
+					var src interface{}
+					switch stmt.ColumnType(col) {
+					case sqlite3.SQLITE_NULL:
+						src = nil
+					case sqlite3.SQLITE_INTEGER:
+						v, _, err := stmt.ColumnInt64(col)
+						if err != nil {
+							return err
+						}
+						src = v
+					case sqlite3.SQLITE_FLOAT:
+						v, _, err := stmt.ColumnDouble(col)
+						if err != nil {
+							return err
+						}
+						src = v
+					case sqlite3.SQLITE_TEXT:
+						v, _, err := stmt.ColumnText(col)
+						if err != nil {
+							return err
+						}
+						src = v
+					case sqlite3.SQLITE_BLOB:
+						v, err := stmt.ColumnBlob(col)
+						if err != nil {
+							return err
+						}
+						src = v
+					default:
+						return fmt.Errorf("slite: cannot scan column type %d", stmt.ColumnType(col))
+					}
+					// Scan writes into a fresh value; copy it into place.
+					base := reflect.New(field.Type)
+					res := base.MethodByName("Scan").Call([]reflect.Value{reflect.ValueOf(&src).Elem()})
+					if !res[0].IsNil() {
+						if serr, ok := res[0].Interface().(error); ok {
+							return fmt.Errorf("slite: Scan failed: %w", serr)
+						}
+						return fmt.Errorf("slite: Scan failed")
+					}
+					srcPtr := unsafe.Pointer(base.Pointer())
+					dst := unsafe.Pointer(uintptr(p) + offset)
+					typedMemmove(dst, srcPtr, field.Type)
+					return nil
+				}
 			} else {
-				return nil, fmt.Errorf("slite: struct field %s has no UnmarshalText and is not time.Time", field.Name)
+				return nil, fmt.Errorf("slite: struct field %s has no UnmarshalText, no Scan, and is not time.Time", field.Name)
 			}
 		}
 	case reflect.Ptr:

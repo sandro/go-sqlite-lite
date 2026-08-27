@@ -311,9 +311,12 @@ func collectStructFields(v reflect.Value, prefix string, fields map[string]inter
 		}
 		fullName := prefix + name
 
-		// Recurse into nested struct fields, but treat time.Time as a
-		// scalar value (don't descend into its internal fields).
-		if fv.Kind() == reflect.Struct && fv.Type() != timeType {
+		// Recurse into nested struct fields, but treat time.Time and any
+		// type implementing encoding.TextUnmarshaler or sql.Scanner (e.g.
+		// guregu null.v4 zero.String, stdlib sql.NullString) as scalar
+		// values — don't descend into their internal fields.
+		if fv.Kind() == reflect.Struct && fv.Type() != timeType &&
+			!implementsTextUnmarshaler(fv.Type()) && !implementsScanner(fv.Type()) {
 			if field.Anonymous {
 				collectStructFields(fv, prefix, fields)
 			} else {
