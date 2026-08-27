@@ -330,6 +330,13 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) (retErr
 
 	indirect := v.Elem()
 	base := sliceType.Elem()
+	// Support []*T destinations: scan into T and append pointers to it.
+	// The scan plan is built for T, not *T.
+	ptrElem := false
+	if base.Kind() == reflect.Ptr {
+		base = base.Elem()
+		ptrElem = true
+	}
 	// Overwrite the destination slice rather than appending, matching the
 	// usual expectation that Select fills dest with the current result set.
 	indirect.Set(reflect.MakeSlice(sliceType, 0, 0))
@@ -352,7 +359,11 @@ func (o *Conn) Select(dest interface{}, sql string, args ...interface{}) (retErr
 		if err = applyPlan(plan, unsafe.Pointer(vp.Pointer()), stmt); err != nil {
 			return err
 		}
-		indirect.Set(reflect.Append(indirect, vp.Elem()))
+		if ptrElem {
+			indirect.Set(reflect.Append(indirect, vp))
+		} else {
+			indirect.Set(reflect.Append(indirect, vp.Elem()))
+		}
 		hasRow, err = stmt.Step()
 		if err != nil {
 			return err

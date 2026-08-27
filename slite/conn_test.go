@@ -513,3 +513,32 @@ func TestGetScalarHint(t *testing.T) {
 		t.Errorf("error should suggest row.Int64(), got: %s", err)
 	}
 }
+
+func TestSelectIntoPointerSlice(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, name TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e1', 'one')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e2', 'two')"))
+
+	type Row struct {
+		ID   string `db:"id"`
+		Name string `db:"name"`
+	}
+	var rows []*Row
+	if err := conn.Select(&rows, "SELECT id, name FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0] == nil || rows[0].ID != "e1" || rows[0].Name != "one" {
+		t.Errorf("rows[0] = %+v, want {e1 one}", rows[0])
+	}
+	if rows[1] == nil || rows[1].ID != "e2" || rows[1].Name != "two" {
+		t.Errorf("rows[1] = %+v, want {e2 two}", rows[1])
+	}
+}
