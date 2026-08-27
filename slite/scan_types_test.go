@@ -1040,3 +1040,77 @@ func TestScanAllTypesInOneStruct(t *testing.T) {
 		t.Errorf("Ts = %v, want %v", row.Ts, want)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// encoding.TextUnmarshaler structs (e.g. guregu null.v4 zero.String)
+// ---------------------------------------------------------------------------
+
+// textString mimics guregu null.v4's zero.String: a struct wrapping a
+// nullable string that implements encoding.TextUnmarshaler with a pointer
+// receiver. It must be scanned as a scalar, not recursed into.
+type textString struct {
+	Value string
+	Valid bool
+}
+
+func (s *textString) UnmarshalText(text []byte) error {
+	s.Value = string(text)
+	s.Valid = s.Value != ""
+	return nil
+}
+
+func TestScanTextUnmarshalerStruct(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, title TEXT, note TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e1', 'OG Test Title', NULL)"))
+
+	type Row struct {
+		ID    string     `db:"id"`
+		Title textString `db:"title"`
+		Note  textString `db:"note"`
+	}
+	var row Row
+	if err := conn.Get(&row, "SELECT id, title, note FROM t WHERE id='e1'"); err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != "e1" {
+		t.Errorf("ID = %q, want e1", row.ID)
+	}
+	if row.Title.Value != "OG Test Title" || !row.Title.Valid {
+		t.Errorf("Title = %+v, want {OG Test Title true}", row.Title)
+	}
+	// NULL column must leave the field at its zero value, not error.
+	if row.Note.Value != "" || row.Note.Valid {
+		t.Errorf("Note = %+v, want zero value", row.Note)
+	}
+}
+
+func TestScanTextUnmarshalerStructSelect(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, title TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e1', 'one')"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e2', 'two')"))
+
+	type Row struct {
+		ID    string     `db:"id"`
+		Title textString `db:"title"`
+	}
+	var rows []Row
+	if err := conn.Select(&rows, "SELECT id, title FROM t ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0].Title.Value != "one" || rows[1].Title.Value != "two" {
+		t.Errorf("titles = %q, %q; want one, two", rows[0].Title.Value, rows[1].Title.Value)
+	}
+}

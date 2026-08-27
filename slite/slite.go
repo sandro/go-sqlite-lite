@@ -3,6 +3,7 @@ package slite
 import (
 	"context"
 	"database/sql"
+	"encoding"
 	"errors"
 	"fmt"
 	"log"
@@ -733,6 +734,17 @@ func getFieldName(fieldType reflect.StructField) string {
 	return name
 }
 
+// implementsTextUnmarshaler reports whether t implements
+// encoding.TextUnmarshaler. The method set is checked on the pointer type
+// because UnmarshalText conventionally has a pointer receiver (as with
+// guregu null.v4's zero.String); a value receiver would also be in the
+// pointer's method set, so checking *t covers both.
+func implementsTextUnmarshaler(t reflect.Type) bool {
+	return reflect.PointerTo(t).Implements(textUnmarshalerType)
+}
+
+var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+
 // scanPlan is a cached, pre-computed mapping from query result columns to
 // struct fields. It is built once per (struct type, column set) pair via
 // reflection, then reused across rows using unsafe pointer arithmetic — no
@@ -843,8 +855,12 @@ func walkFields(typ reflect.Type, colNames []string, consumed []bool, matchedFie
 		name := getFieldName(fieldType)
 		path := prefix + fieldType.Name
 		absOffset := baseOffset + fieldType.Offset
-		// Scalar-like field (including time.Time): try direct column match.
-		if fieldType.Type.Kind() != reflect.Struct || fieldType.Type == timeType {
+		// Scalar-like field (including time.Time and any type implementing
+		// encoding.TextUnmarshaler, e.g. guregu null.v4 zero.String): try
+		// direct column match. TextUnmarshaler structs must be treated as
+		// scalars, not recursed into — their inner fields (like
+		// sql.NullString's String/Valid) never match query columns.
+		if fieldType.Type.Kind() != reflect.Struct || fieldType.Type == timeType || implementsTextUnmarshaler(fieldType.Type) {
 			if !matchedField[path] {
 				if idx := findColumn(colNames, consumed, name); idx >= 0 {
 					entry, err := newScanEntry(fieldType, absOffset)
@@ -1001,8 +1017,7 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 			}
 		} else {
 			// Non-time struct: try UnmarshalText.
-			m := reflect.New(field.Type).MethodByName("UnmarshalText")
-			if !m.IsZero() {
+			if implementsTextUnmarshaler(field.Type) {
 				entry.setter = func(p unsafe.Pointer, stmt *sqlite3.Stmt, col int) error {
 					v, err := stmt.ColumnBlob(col)
 					if err != nil {
@@ -1010,7 +1025,7 @@ func newScanEntry(field reflect.StructField, offset uintptr) (*scanEntry, error)
 					}
 					// UnmarshalText writes into a fresh value; copy it into place.
 					base := reflect.New(field.Type)
-					res := m.Call([]reflect.Value{reflect.ValueOf(v)})
+					res := base.MethodByName("UnmarshalText").Call([]reflect.Value{reflect.ValueOf(v)})
 					if !res[0].IsNil() {
 						if uerr, ok := res[0].Interface().(error); ok {
 							return fmt.Errorf("slite: UnmarshalText failed: %w", uerr)
