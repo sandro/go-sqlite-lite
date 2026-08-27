@@ -542,3 +542,45 @@ func TestSelectIntoPointerSlice(t *testing.T) {
 		t.Errorf("rows[1] = %+v, want {e2 two}", rows[1])
 	}
 }
+
+func TestPlanCacheKeyedByStructType(t *testing.T) {
+	conn, err := NewConn(":memory:", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mustRes(conn.Exec("CREATE TABLE t (id TEXT, name TEXT)"))
+	mustRes(conn.Exec("INSERT INTO t VALUES ('e1', 'one')"))
+
+	// Same SQL scanned into two different struct types on the same Conn.
+	// The per-Conn plan cache must key by (type, SQL), not SQL alone —
+	// otherwise the second scan reuses the first type's setters and writes
+	// garbage into differently-typed fields.
+	type RowA struct {
+		ID   string `db:"id"`
+		Name string `db:"name"`
+	}
+	type RowB struct {
+		Name string `db:"name"`
+		ID   int64  `db:"id"`
+	}
+	var a RowA
+	if err := conn.Get(&a, "SELECT id, name FROM t WHERE id='e1'"); err != nil {
+		t.Fatal(err)
+	}
+	if a.ID != "e1" || a.Name != "one" {
+		t.Errorf("RowA = %+v, want {e1 one}", a)
+	}
+	var b RowB
+	if err := conn.Get(&b, "SELECT id, name FROM t WHERE id='e1'"); err != nil {
+		t.Fatal(err)
+	}
+	if b.Name != "one" {
+		t.Errorf("RowB.Name = %q, want one", b.Name)
+	}
+	// int64 setter reading a TEXT column yields 0 — but crucially it must
+	// not be the string setter from RowA's plan writing into the int64.
+	if b.ID != 0 {
+		t.Errorf("RowB.ID = %d, want 0 (string setter leaked from RowA plan)", b.ID)
+	}
+}

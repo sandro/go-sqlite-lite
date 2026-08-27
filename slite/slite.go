@@ -114,7 +114,7 @@ func getDefaultLogger() Logger {
 type Conn struct {
 	db        *sqlite3.Conn
 	stmtCache map[string]*sqlite3.Stmt
-	planCache map[string]*scanPlan // keyed by SQL string, like stmtCache
+	planCache map[planKey]*scanPlan // keyed by (struct type, SQL string)
 	logger    Logger
 	loggerMu  sync.RWMutex
 	closed    bool
@@ -198,7 +198,7 @@ func NewConn(uri string, readonly bool) (*Conn, error) {
 			maxBinds = lim
 		}
 	})
-	conn := &Conn{db: c, stmtCache: make(map[string]*sqlite3.Stmt), planCache: make(map[string]*scanPlan)}
+	conn := &Conn{db: c, stmtCache: make(map[string]*sqlite3.Stmt), planCache: make(map[planKey]*scanPlan)}
 	return conn, nil
 }
 
@@ -254,10 +254,12 @@ func (o *Conn) Commit() error   { return o.db.Commit() }
 func (o *Conn) Rollback() error { return o.db.Rollback() }
 
 // cachedPlan returns the scan plan for (base, stmt), building and caching it
-// on the Conn keyed by sqlStr. This avoids re-walking the struct and the
-// global planCache string-building on every call.
+// on the Conn keyed by sqlStr AND the destination struct type. The type must
+// be part of the key: the same SQL scanned into two different struct types
+// (e.g. one with a string id, one with an int64 id) must not share a plan.
 func (o *Conn) cachedPlan(sqlStr string, base reflect.Type, stmt *sqlite3.Stmt) (*scanPlan, error) {
-	if p, ok := o.planCache[sqlStr]; ok {
+	key := planKey{typeID: typeID(base), colKey: sqlStr}
+	if p, ok := o.planCache[key]; ok {
 		return p, nil
 	}
 	colNames := stmt.ColumnNames()
@@ -265,7 +267,7 @@ func (o *Conn) cachedPlan(sqlStr string, base reflect.Type, stmt *sqlite3.Stmt) 
 	if err != nil {
 		return nil, err
 	}
-	o.planCache[sqlStr] = plan
+	o.planCache[key] = plan
 	return plan, nil
 }
 
